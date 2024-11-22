@@ -1255,6 +1255,12 @@ func (gm *GatewayManager) CreateVirtualService(ctx context.Context, virtualServi
 		virtualServiceConfig.ApplicationProfile.Name = "System-Secure-HTTP"
 		virtualServiceConfig.ApplicationProfile.Type_ = "HTTPS"
 		break
+	
+	case "UDP":
+		virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
+		virtualServiceConfig.ApplicationProfile.Type_ = "L4"
+		virtualServiceConfig.ServicePorts.TcpUdpProfile = "UDP_FAST_PATH"
+		break
 
 	default:
 		return nil, fmt.Errorf("unhandled virtual service type [%s]", vsType)
