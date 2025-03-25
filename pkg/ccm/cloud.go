@@ -116,7 +116,7 @@ func newVCDCloudProvider(configReader io.Reader) (cloudProvider.Interface, error
 	vmInfoCache := newVmInfoCache(vcdClient, cloudConfig.VAppName, time.Minute)
 
 	// TODO: upgrade all CAPVCD RDEs here
-
+	
 	err = cpiRdeManager.UpgradeCPIStatusOfExistingRDE(context.Background(), cloudConfig.ClusterID)
 	if err != nil {
 		klog.Errorf("failed to create CPI status in the RDE [%s]: [%v]", cloudConfig.ClusterID, err)

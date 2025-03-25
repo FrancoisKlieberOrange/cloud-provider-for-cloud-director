@@ -233,7 +233,7 @@ func getUnusedIPAddressInAllowedRange(startIPAddress string, endIPAddress string
 	freeIP := ""
 	currIP := startIP
 	for !currIP.Equal(endIP) {
-		if !usedIPAddresses[currIP.String()] && checkIfIPInRanges(currIP.String(), ipRangeListPtr) {
+		if !usedIPAddresses[currIP.String()] && CheckIfIPInRanges(currIP.String(), ipRangeListPtr) {
 			freeIP = currIP.String()
 			break
 		}
@@ -244,9 +244,9 @@ func getUnusedIPAddressInAllowedRange(startIPAddress string, endIPAddress string
 	return freeIP, nil
 }
 
-// checkIfIPInRanges checks if the ipStr is in the list of ranges provided in ipRangeListPtr
+// CheckIfIPInRanges checks if the ipStr is in the list of ranges provided in ipRangeListPtr
 // If ipRangeListPtr is nil, ipStr is found. This was the simplest way to not have a check.
-func checkIfIPInRanges(ipStr string, ipRangeListPtr *[]IPRange) bool {
+func CheckIfIPInRanges(ipStr string, ipRangeListPtr *[]IPRange) bool {
 	if ipRangeListPtr == nil {
 		return true
 	}
@@ -262,4 +262,65 @@ func checkIfIPInRanges(ipStr string, ipRangeListPtr *[]IPRange) bool {
 	}
 
 	return false
+}
+
+// 
+
+func GetOVDCNetworkIPRange(ctx context.Context, client *Client, networkName string, ovdcName string) ([]IPRange, error) {
+	var IpRanges = []IPRange{}
+	
+	if networkName == "" {
+		return IpRanges, fmt.Errorf("network name should not be empty")
+	}
+
+	ovdcNetworksAPI := client.APIClient.OrgVdcNetworksApi
+	pageNum := int32(1)
+	// ovdcNetworkID := ""
+	org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+
+	if err != nil {
+		return IpRanges, fmt.Errorf("error getting org by name for org [%s]: [%v]", client.ClusterOrgName, err)
+	}
+	if org == nil || org.Org == nil {
+		return IpRanges, fmt.Errorf("obtained nil org when getting org by name [%s]", client.ClusterOrgName)
+	}
+	// networkFound := false
+	for {
+		ovdcNetworks, resp, err := ovdcNetworksAPI.GetAllVdcNetworks(ctx, org.Org.ID, pageNum, 32, nil)
+		if err != nil {
+			// TODO: log resp in debug mode only
+			return IpRanges, fmt.Errorf("unable to get all ovdc networks: [%+v]: [%v]", resp, err)
+		}
+
+		if len(ovdcNetworks.Values) == 0 {
+			break
+		}
+
+		for _, ovdcNetwork := range ovdcNetworks.Values {
+			if ovdcNetwork.Name == networkName {
+				
+				// extract ovdcNetwork IP range
+				for _, subnet := range ovdcNetwork.Subnets.Values {
+					if subnet.IpRanges == nil {
+						continue
+					}
+					for _, ipRangeValue := range subnet.IpRanges.Values {
+						IpRanges = append(IpRanges, IPRange{
+							StartIP: ipRangeValue.StartAddress,
+							EndIP:   ipRangeValue.EndAddress,
+						})
+					}
+				}
+
+			}
+		}
+		pageNum++
+	}
+
+
+	klog.Infof("Network information: %s", IpRanges)
+
+	
+
+	return IpRanges, nil
 }

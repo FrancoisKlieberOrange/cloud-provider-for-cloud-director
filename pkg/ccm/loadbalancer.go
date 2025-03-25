@@ -18,7 +18,7 @@ import (
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	// metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	cloudProvider "k8s.io/cloud-provider"
 	"k8s.io/klog"
@@ -32,6 +32,7 @@ const (
 	skipAviSSLTerminationAnnotation = `service.beta.kubernetes.io/vcloud-avi-ssl-no-termination`
 	// TODO: Update controlPlaneLabel to use default K8s constants if available
 	controlPlaneLabel = `node-role.kubernetes.io/control-plane`
+	ServiceAnnotationLoadBalancerNetworkName            = "service.beta.kubernetes.io/vcloud-loadbalancer-network-name"
 )
 
 // LBManager -
@@ -54,7 +55,7 @@ func newLoadBalancer(vcdClient *vcdsdk.Client, certAlias string, oneArm *vcdsdk.
 
 	return &LBManager{
 		vcdClient:                    vcdClient,
-		kubeClient:                   GetK8SClient(),
+		// kubeClient:                   GetK8SClient(),
 		namespace:                    "default",
 		CertificateAlias:             certAlias,
 		OneArm:                       oneArm,
@@ -115,19 +116,19 @@ func (lb *LBManager) removeLBResourcesFromRDE(ctx context.Context, resourcesDeal
 	return nil
 }
 
-func (lb *LBManager) getNodeIPs(ctx context.Context) ([]string, error) {
-	nodes, err := lb.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("unable to get nodes of cluster: [%v]", err)
-	}
+// func (lb *LBManager) getNodeIPs(ctx context.Context) ([]string, error) {
+// 	nodes, err := lb.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("unable to get nodes of cluster: [%v]", err)
+// 	}
 
-	nodeIPs := make([]string, len(nodes.Items))
-	for idx, node := range nodes.Items {
-		nodeIPs[idx] = node.Status.Addresses[0].Address
-	}
+// 	nodeIPs := make([]string, len(nodes.Items))
+// 	for idx, node := range nodes.Items {
+// 		nodeIPs[idx] = node.Status.Addresses[0].Address
+// 	}
 
-	return nodeIPs, nil
-}
+// 	return nodeIPs, nil
+// }
 
 // EnsureLoadBalancer creates a new load balancer 'name', or updates the existing one.
 // Returns the status of the balancer. Implementations must treat the *v1.Service and *v1.Node
@@ -139,22 +140,27 @@ func (lb *LBManager) EnsureLoadBalancer(ctx context.Context, clusterName string,
 	if err = lb.vcdClient.RefreshBearerToken(); err != nil {
 		return nil, fmt.Errorf("error while obtaining access token: [%v]", err)
 	}
-	nodeIPs := lb.getWorkerNodeInternalIps(nodes)
+	// nodeIPs := lb.getNodeNetworkIps(ctx, nodes, lb.ovdcNetworkName)
+
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+
+	nodeIPs := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
+	
 	return lb.createLoadBalancer(ctx, service, nodeIPs)
 }
 
-func (lb *LBManager) getNodeInternalIps(nodes []*v1.Node) []string {
-	nodeIps := make([]string, len(nodes))
-	for i, node := range nodes {
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == v1.NodeInternalIP {
-				nodeIps[i] = addr.Address
-				break
-			}
-		}
-	}
-	return nodeIps
-}
+// func (lb *LBManager) getNodeInternalIps(nodes []*v1.Node) []string {
+// 	nodeIps := make([]string, len(nodes))
+// 	for i, node := range nodes {
+// 		for _, addr := range node.Status.Addresses {
+// 			if addr.Type == v1.NodeInternalIP {
+// 				nodeIps[i] = addr.Address
+// 				break
+// 			}
+// 		}
+// 	}
+// 	return nodeIps
+// }
 
 func (lb *LBManager) getServicePortMap(service *v1.Service) (map[string]int32, map[string]int32, map[string]string) {
 	typeToInternalPort := make(map[string]int32)
@@ -191,6 +197,34 @@ func (lb *LBManager) getWorkerNodeInternalIps(nodes []*v1.Node) []string {
 	return workerNodeInternalIps
 }
 
+func (lb *LBManager) getNodeNetworkIps(ctx context.Context, nodes []*v1.Node, networkName string) []string {
+	var workerNodeInternalIps []string
+
+	IpRanges, err := vcdsdk.GetOVDCNetworkIPRange(ctx, lb.vcdClient, networkName, lb.ovdcName)
+	if err != nil {
+		return workerNodeInternalIps
+	}
+	klog.Infof("Network information: %s", IpRanges)
+	
+	for _, node := range nodes {
+		nodeLabelMap := node.ObjectMeta.Labels
+		// If we can find the worker node from the missing controlPlaneLabel in nodeLabelMap we will take it,
+		// but if the node is missing labels, we will just let it go instead of adding it.
+		if nodeLabelMap != nil {
+			if _, ok := nodeLabelMap[controlPlaneLabel]; !ok {
+				for _, addr := range node.Status.Addresses {
+					if vcdsdk.CheckIfIPInRanges(addr.Address, &IpRanges)  {
+						klog.Infof("Node Subnet IP found: %s", addr.Address)
+						workerNodeInternalIps = append(workerNodeInternalIps, addr.Address)
+						break
+					}
+				}
+			}
+		}
+	}
+	return workerNodeInternalIps
+}
+
 // UpdateLoadBalancer updates hosts under the specified load balancer.
 // Implementations must treat the *v1.Service and *v1.Node
 // parameters as read-only and not modify them.
@@ -202,7 +236,11 @@ func (lb *LBManager) UpdateLoadBalancer(ctx context.Context, clusterName string,
 		return fmt.Errorf("error while obtaining access token: [%v]", err)
 	}
 
-	nodeIps := lb.getWorkerNodeInternalIps(nodes)
+	// nodeIps := lb.getWorkerNodeInternalIps(nodes)
+
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	nodeIps := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
+
 	klog.Infof("UpdateLoadBalancer Node Ips: %v", nodeIps)
 
 	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
@@ -221,7 +259,7 @@ func (lb *LBManager) UpdateLoadBalancer(ctx context.Context, clusterName string,
 		lbPoolName := fmt.Sprintf("%s-%s", lbPoolNamePrefix, portName)
 		virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portName)
 		externalPort := typeToExternalPort[portName]
-		gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, lb.ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+		gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
 		if err != nil {
 			return fmt.Errorf("error while creating GatewayManager: [%v]", err)
 		}
@@ -288,9 +326,10 @@ func (lb *LBManager) EnsureLoadBalancerDeleted(ctx context.Context, clusterName 
 func (lb *LBManager) getLoadBalancer(ctx context.Context,
 	service *v1.Service) (status *v1.LoadBalancerStatus, portNameToIPMap map[string]string, err error) {
 
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
 	virtualServiceNamePrefix := lb.getLoadBalancerPrefix(ctx, service)
 	virtualIP := ""
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, lb.ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error while creating GatewayManager: [%v]", err)
 	}
@@ -418,6 +457,7 @@ func (lb *LBManager) GetLoadBalancerName(ctx context.Context, clusterName string
 
 func (lb *LBManager) deleteLoadBalancer(ctx context.Context, service *v1.Service) error {
 
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
 	lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
 	virtualServiceName := lb.getVirtualServicePrefix(ctx, service)
 	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
@@ -435,7 +475,7 @@ func (lb *LBManager) deleteLoadBalancer(ctx context.Context, service *v1.Service
 	}
 	klog.Infof("Deleting loadbalancer for ports [%#v]\n", portDetailsList)
 
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, lb.ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
 	if err != nil {
 		return fmt.Errorf("error while creating GatewayManager: [%v]", err)
 	}
@@ -528,7 +568,8 @@ func getUserSpecifiedLoadBalancerIP(service *v1.Service) string {
 
 func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service,
 	nodeIPs []string) (*v1.LoadBalancerStatus, error) {
-
+	
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
 	lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
 	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
 	virtualServiceNamePrefix := lb.getVirtualServicePrefix(ctx, service)
@@ -549,7 +590,7 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	if removeErr != nil {
 		klog.Errorf("error adding CPI error [%s] to the RDE [%s], [%v]", cpisdk.GetLoadbalancerError, lb.clusterID, removeErr)
 	}
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, lb.ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
 	if err != nil {
 		return nil, fmt.Errorf("error while creating GatewayManager: [%v]", err)
 	}
@@ -818,4 +859,22 @@ func (lb *LBManager) verifyVCDResourcesForApplicationLB(ctx context.Context, vir
 		}
 	}
 	return false, nil
+}
+
+
+// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting
+func getStringFromServiceAnnotation(service *v1.Service, annotationKey string, defaultSetting string) string {
+	klog.V(4).Infof("getStringFromServiceAnnotation(%s/%s, %v, %v)", service.Namespace, service.Name, annotationKey, defaultSetting)
+	if annotationValue, ok := service.Annotations[annotationKey]; ok {
+		//if there is an annotation for this setting, set the "setting" var to it
+		// annotationValue can be empty, it is working as designed
+		// it makes possible for instance provisioning loadbalancer without floatingip
+		klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, annotationValue)
+		return annotationValue
+	}
+	//if there is no annotation, set "settings" var to the value from cloud config
+	if defaultSetting != "" {
+		klog.V(4).Infof("Could not find a Service Annotation; falling back on cloud-config setting: %v = %v", annotationKey, defaultSetting)
+	}
+	return defaultSetting
 }
