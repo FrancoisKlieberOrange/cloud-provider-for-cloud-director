@@ -32,6 +32,11 @@ func GetVirtualServicePrefix(service *v1.Service, clusterId string) string {
 	return fmt.Sprintf("ingress-vs-%s-%s", service.Name, getTrimmedClusterID(clusterId))
 }
 
+func GetStaticMembersGroupPrefix(serviceName, clusterID string) string {
+    return fmt.Sprintf("ingress-sg-%s-%s", serviceName, getTrimmedClusterID(clusterID))
+}
+
+
 func GetPortDetailsList(svc *v1.Service) []vcdsdk.PortDetails {
 	portDetailsList := make([]vcdsdk.PortDetails, len(svc.Spec.Ports))
 	for idx, port := range svc.Spec.Ports {

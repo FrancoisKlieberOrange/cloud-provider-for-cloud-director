@@ -36,6 +36,7 @@ type GatewayManager struct {
 	// Client will be refreshed before each call
 	Client     *Client
 	IPAMSubnet string
+	TransparentMode    bool
 }
 
 // CacheGatewayDetails get gateway reference and cache some details in client object
@@ -1410,6 +1411,9 @@ type PortDetails struct {
 	InternalPort int32
 	UseSSL       bool
 	CertAlias    string
+
+	ServerGroupID  string `json:"serverGroupId,omitempty"`
+	UseServerGroup bool   `json:"useServerGroup,omitempty"`
 }
 
 // GetLoadBalancer :

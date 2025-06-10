@@ -33,6 +33,7 @@ const (
 	// TODO: Update controlPlaneLabel to use default K8s constants if available
 	controlPlaneLabel = `node-role.kubernetes.io/control-plane`
 	ServiceAnnotationLoadBalancerNetworkName            = "service.beta.kubernetes.io/vcloud-loadbalancer-network-name"
+	ServiceAnnotationTransparentMode = "service.beta.kubernetes.io/vcd-loadbalancer-transparent-mode"
 )
 
 // LBManager -
@@ -48,6 +49,8 @@ type LBManager struct {
 	ipamSubnet                   string
 	clusterID                    string
 	EnableVirtualServiceSharedIP bool
+	TransparentMode              bool
+	nodesForTransparentMode      []*v1.Node
 }
 
 func newLoadBalancer(vcdClient *vcdsdk.Client, certAlias string, oneArm *vcdsdk.OneArm,
@@ -64,6 +67,8 @@ func newLoadBalancer(vcdClient *vcdsdk.Client, certAlias string, oneArm *vcdsdk.
 		ipamSubnet:                   ipamSubnet,
 		clusterID:                    clusterID,
 		EnableVirtualServiceSharedIP: enableVirtualServiceSharedIP,
+		TransparentMode:              transparentMode,
+		nodesForTransparentMode:      nodesForTransparentMode,
 	}
 }
 
@@ -130,6 +135,19 @@ func (lb *LBManager) removeLBResourcesFromRDE(ctx context.Context, resourcesDeal
 // 	return nodeIPs, nil
 // }
 
+func (lb *LBManager) isTransparentModeEnabled(service *v1.Service) bool {
+    useTransparentMode := lb.TransparentMode
+    if transparentModeAnnotation, exists := service.Annotations[ServiceAnnotationTransparentMode]; exists {
+        if transparentMode, err := strconv.ParseBool(transparentModeAnnotation); err == nil {
+            useTransparentMode = transparentMode
+        } else {
+            klog.Warningf("Invalid value for annotation %s: %s. Using global setting: %v",
+                ServiceAnnotationTransparentMode, transparentModeAnnotation, useTransparentMode)
+        }
+    }
+    return useTransparentMode
+}
+
 // EnsureLoadBalancer creates a new load balancer 'name', or updates the existing one.
 // Returns the status of the balancer. Implementations must treat the *v1.Service and *v1.Node
 // parameters as read-only and not modify them.
@@ -140,13 +158,19 @@ func (lb *LBManager) EnsureLoadBalancer(ctx context.Context, clusterName string,
 	if err = lb.vcdClient.RefreshBearerToken(); err != nil {
 		return nil, fmt.Errorf("error while obtaining access token: [%v]", err)
 	}
-	// nodeIPs := lb.getNodeNetworkIps(ctx, nodes, lb.ovdcNetworkName)
 
 	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
 
-	nodeIPs := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
-	
-	return lb.createLoadBalancer(ctx, service, nodeIPs)
+	useTransparentMode := lb.isTransparentModeEnabled(service)
+	if useTransparentMode {
+		lb.nodesForTransparentMode = nodes
+		return lb.createLoadBalancer(ctx, service, []string{})
+	} else {
+		nodeIPs := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
+		return lb.createLoadBalancer(ctx, service, nodeIPs)
+	}
+
+
 }
 
 // func (lb *LBManager) getNodeInternalIps(nodes []*v1.Node) []string {
@@ -442,6 +466,52 @@ func (lb *LBManager) getVirtualServicePrefix(_ context.Context, service *v1.Serv
 	return fmt.Sprintf("ingress-vs-%s-%s", service.Name, lb.getTrimmedClusterID())
 }
 
+func (lb *LBManager) GetStaticMembersGroupPrefix(serviceName, clusterID string) string {
+	return fmt.Sprintf("ingress-sg-%s-%s", serviceName, lb.getTrimmedClusterID(clusterID))
+}
+
+
+// deleteStaticMembersGroups supprime les groupes de membres statiques associés à un service
+func (lb *LBManager) deleteStaticMembersGroups(ctx context.Context, service *v1.Service) error {
+    // Vérifier que nous sommes bien en mode transparent
+    useTransparentMode := lb.isTransparentModeEnabled(service)
+    if !useTransparentMode {
+        klog.Infof("Service %s/%s is not in transparent mode, skipping static members groups deletion", 
+            service.Namespace, service.Name)
+        return nil
+    }
+    if lb.gatewayManager == nil {
+        ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+        gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+        if err != nil {
+            return fmt.Errorf("error while creating GatewayManager: [%v]", err)
+        }
+        gm.TransparentMode = useTransparentMode
+        lb.gatewayManager = gm
+    } else {
+        lb.gatewayManager.TransparentMode = useTransparentMode
+    }
+    
+    // Pour chaque port du service, supprimer le groupe de membres statiques correspondant
+    var lastError error
+    for _, port := range service.Spec.Ports {
+        staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
+            "-" + strconv.Itoa(int(port.Port))
+        
+        err := lb.gatewayManager.DeleteStaticMembersGroup(ctx, staticMembersGroupName, false)
+        if err != nil {
+            klog.Warningf("Failed to delete static members group %s: %v", staticMembersGroupName, err)
+            lastError = err
+            // Continuer malgré l'erreur pour nettoyer autant de ressources que possible
+        }
+    }
+    
+    return lastError
+}
+
+
+
+
 // getLoadBalancerIpClaimMarker returns a string comprising the service namespace, service name and
 // cluster Id, which allows CPI to uniquely mark an IP Allocation (from an Ip Space) being owned
 // by a particular service running on a specific cluster under a specific namespace
@@ -566,14 +636,42 @@ func getUserSpecifiedLoadBalancerIP(service *v1.Service) string {
 	return service.Spec.LoadBalancerIP
 }
 
+// getVMIDForNode récupère l'ID de la VM pour un nœud Kubernetes
+func (lb *LBManager) getVMIDForNode(ctx context.Context, node *v1.Node) (string, error) {
+    providerID := node.Spec.ProviderID
+    if providerID == "" {
+        return "", fmt.Errorf("node %s has no providerID", node.Name)
+    }
+
+    // Le format du providerID est généralement: vcd://<org>/<vdc>/<vm-id>
+    // Extraire l'ID de la VM
+    parts := strings.Split(providerID, "/")
+    if len(parts) < 4 {
+        return "", fmt.Errorf("invalid providerID format for node %s: %s", node.Name, providerID)
+    }
+    vmID := parts[len(parts)-1]
+
+    // Vérifier que l'ID de la VM est valide
+    if vmID == "" {
+        return "", fmt.Errorf("empty VM ID extracted from providerID for node %s: %s", node.Name, providerID)
+    }
+
+    return vmID, nil
+}
+
+
 func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service,
 	nodeIPs []string) (*v1.LoadBalancerStatus, error) {
 	
-	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	useTransparentMode := lb.isTransparentModeEnabled(service)
+	
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName) // toto
 	lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
 	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
 	virtualServiceNamePrefix := lb.getVirtualServicePrefix(ctx, service)
 	lbStatus, portNameToIPMap, err := lb.getLoadBalancer(ctx, service)
+	//juste pour voir : 
+	TransparentMode := getStringFromServiceAnnotation(service, ServiceAnnotationTransparentMode, lb.TransparentMode)
 
 	rdeManager := vcdsdk.NewRDEManager(lb.vcdClient, lb.clusterID, release.CloudControllerManagerName, release.Version)
 	cpiRdeManager := cpisdk.NewCPIRDEManager(rdeManager)
@@ -590,10 +688,13 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	if removeErr != nil {
 		klog.Errorf("error adding CPI error [%s] to the RDE [%s], [%v]", cpisdk.GetLoadbalancerError, lb.clusterID, removeErr)
 	}
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName) // toto
 	if err != nil {
 		return nil, fmt.Errorf("error while creating GatewayManager: [%v]", err)
 	}
+
+	gm.TransparentMode = useTransparentMode
+	lb.gatewayManager = gm
 
 	// golang doesn't have the set data structure
 	lbExists := true
@@ -611,6 +712,41 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	klog.Infof("createLoadBalancer called with loadBalancerIP [%s] for service [%s]", userSpecifiedLBIP, service.Name)
 
 	if lbExists {
+		if useTransparentMode && lb.nodesForTransparentMode != nil {
+			// Pour chaque port, mettre à jour le groupe de membres statiques
+			for _, port := range service.Spec.Ports {
+				staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
+					"-" + strconv.Itoa(int(port.Port))
+				
+				// Collecter les IDs des VMs des nœuds
+				vmIDs := make([]string, 0, len(lb.nodesForTransparentMode))
+				for _, node := range lb.nodesForTransparentMode {
+					// Obtenir l'ID de la VM pour ce nœud
+					vmID, err := lb.getVMIDForNode(ctx, node)
+					if err != nil {
+						return nil, fmt.Errorf("failed to get VM ID for node %s: %v", node.Name, err)
+					}
+					vmIDs = append(vmIDs, vmID)
+				}
+				
+				_, err := gm.CreateOrUpdateStaticMembersGroup(ctx, staticMembersGroupName, vmIDs)
+				if err != nil {
+					return nil, fmt.Errorf("failed to update static members group for service %s/%s port %d: %v",
+						service.Namespace, service.Name, port.Port, err)
+				}
+			}
+			
+			// Recréer le statut du load balancer
+			lbStatus, _, err = lb.getLoadBalancer(ctx, service)
+			if err != nil {
+				addToErrorSetErr := cpiRdeManager.AddToErrorSetWithNameAndId(ctx, cpisdk.GetLoadbalancerError, "", virtualServiceNamePrefix, err.Error())
+				if addToErrorSetErr != nil {
+					klog.Errorf("error adding CPI error [%s] to the RDE [%s], [%v]", cpisdk.GetLoadbalancerError, lb.clusterID, addToErrorSetErr)
+				}
+				return nil, fmt.Errorf("unexpected error while querying for loadbalancer after updating load balancer: [%v]", err)
+			}
+			return lbStatus, nil
+		}
 		// Update load balancer if there are changes in service properties
 		typeToInternalPortMap, typeToExternalPortMap, nameToProtocol := lb.getServicePortMap(service)
 		for portName, internalPort := range typeToInternalPortMap {
@@ -699,27 +835,81 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	for _, port := range ports {
 		portsMap[port] = true
 	}
-	for idx, port := range service.Spec.Ports {
-		portDetailsList[idx] = vcdsdk.PortDetails{
-			PortSuffix:   port.Name,
-			ExternalPort: port.Port,
-			InternalPort: port.NodePort,
-			Protocol:     strings.ToUpper(string(port.Protocol)),
-		}
-		if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
-			switch strings.ToUpper(*port.AppProtocol) {
-			// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
-			case "HTTP", "HTTPS", "TCP":
-				portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
+
+	if useTransparentMode && lb.nodesForTransparentMode != nil {
+		for idx, port := range service.Spec.Ports {
+			// Créer un groupe de membres statiques pour ce port
+			staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
+				"-" + strconv.Itoa(int(port.Port))
+			
+			// Collecter les IDs des VMs des nœuds
+			vmIDs := make([]string, 0, len(lb.nodesForTransparentMode))
+			for _, node := range lb.nodesForTransparentMode {
+				// Obtenir l'ID de la VM pour ce nœud
+				vmID, err := lb.getVMIDForNode(ctx, node)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get VM ID for node %s: %v", node.Name, err)
+				}
+				vmIDs = append(vmIDs, vmID)
+			}
+			
+			// Créer le groupe de membres statiques
+			staticMembersGroupID, err := gm.CreateOrUpdateStaticMembersGroup(ctx, staticMembersGroupName, vmIDs)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create static members group for service %s/%s port %d: %v",
+					service.Namespace, service.Name, port.Port, err)
+			}
+			
+			// Préparer les détails du port
+			portDetailsList[idx] = vcdsdk.PortDetails{
+				PortSuffix:		   port.Name,
+				ExternalPort:		 port.Port,
+				InternalPort:		 port.NodePort,
+				Protocol:			 strings.ToUpper(string(port.Protocol)),
+				StaticMembersGroupID: staticMembersGroupID,
+				UseStaticMembersGroup: true,
+			}
+			if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
+				switch strings.ToUpper(*port.AppProtocol) {
+				// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
+				case "HTTP", "HTTPS", "TCP":
+					portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
+				}
+			}
+			
+			if _, ok := portsMap[port.Port]; ok {
+				if !skipAviSSLTermination {
+					portDetailsList[idx].UseSSL = true
+					if certAlias == "" {
+						return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
+					}
+					portDetailsList[idx].CertAlias = certAlias
+				}
 			}
 		}
-		if _, ok := portsMap[port.Port]; ok {
-			if !skipAviSSLTermination {
-				portDetailsList[idx].UseSSL = true
-				if certAlias == "" {
-					return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
+	} else {
+		for idx, port := range service.Spec.Ports {
+			portDetailsList[idx] = vcdsdk.PortDetails{
+				PortSuffix:   port.Name,
+				ExternalPort: port.Port,
+				InternalPort: port.NodePort,
+				Protocol:	 strings.ToUpper(string(port.Protocol)),
+			}
+			if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
+				switch strings.ToUpper(*port.AppProtocol) {
+				// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
+				case "HTTP", "HTTPS", "TCP":
+					portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
 				}
-				portDetailsList[idx].CertAlias = certAlias
+			}
+			if _, ok := portsMap[port.Port]; ok {
+				if !skipAviSSLTermination {
+					portDetailsList[idx].UseSSL = true
+					if certAlias == "" {
+						return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
+					}
+					portDetailsList[idx].CertAlias = certAlias
+				}
 			}
 		}
 	}

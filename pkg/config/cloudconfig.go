@@ -56,6 +56,7 @@ type LBConfig struct {
 	VDCNetwork                   string  `yaml:"network"`
 	VIPSubnet                    string  `yaml:"vipSubnet"`
 	EnableVirtualServiceSharedIP bool    `yaml:"enableVirtualServiceSharedIP"`
+	TransparentMode              bool    `yaml:"transparentMode"`
 }
 
 // CloudConfig contains the config that will be read from the secret
