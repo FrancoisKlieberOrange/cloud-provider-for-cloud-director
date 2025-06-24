@@ -49,8 +49,7 @@ type LBManager struct {
 	ipamSubnet                   string
 	clusterID                    string
 	EnableVirtualServiceSharedIP bool
-	TransparentMode              bool
-	nodesForTransparentMode      []*v1.Node
+	//TransparentMode              bool
 }
 
 func newLoadBalancer(vcdClient *vcdsdk.Client, certAlias string, oneArm *vcdsdk.OneArm,
@@ -67,8 +66,7 @@ func newLoadBalancer(vcdClient *vcdsdk.Client, certAlias string, oneArm *vcdsdk.
 		ipamSubnet:                   ipamSubnet,
 		clusterID:                    clusterID,
 		EnableVirtualServiceSharedIP: enableVirtualServiceSharedIP,
-		TransparentMode:              transparentMode,
-		nodesForTransparentMode:      nodesForTransparentMode,
+	//	TransparentMode:              transparentMode,
 	}
 }
 
@@ -121,22 +119,8 @@ func (lb *LBManager) removeLBResourcesFromRDE(ctx context.Context, resourcesDeal
 	return nil
 }
 
-// func (lb *LBManager) getNodeIPs(ctx context.Context) ([]string, error) {
-// 	nodes, err := lb.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-// 	if err != nil {
-// 		return nil, fmt.Errorf("unable to get nodes of cluster: [%v]", err)
-// 	}
-
-// 	nodeIPs := make([]string, len(nodes.Items))
-// 	for idx, node := range nodes.Items {
-// 		nodeIPs[idx] = node.Status.Addresses[0].Address
-// 	}
-
-// 	return nodeIPs, nil
-// }
-
 func (lb *LBManager) isTransparentModeEnabled(service *v1.Service) bool {
-    useTransparentMode := lb.TransparentMode
+    useTransparentMode := false
     if transparentModeAnnotation, exists := service.Annotations[ServiceAnnotationTransparentMode]; exists {
         if transparentMode, err := strconv.ParseBool(transparentModeAnnotation); err == nil {
             useTransparentMode = transparentMode
@@ -160,31 +144,11 @@ func (lb *LBManager) EnsureLoadBalancer(ctx context.Context, clusterName string,
 	}
 
 	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	lb.ovdcNetworkName = ovdcNetworkName
 
-	useTransparentMode := lb.isTransparentModeEnabled(service)
-	if useTransparentMode {
-		lb.nodesForTransparentMode = nodes
-		return lb.createLoadBalancer(ctx, service, []string{})
-	} else {
-		nodeIPs := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
-		return lb.createLoadBalancer(ctx, service, nodeIPs)
-	}
-
-
+	nodeIPs := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
+	return lb.createLoadBalancer(ctx, service, nodeIPs)
 }
-
-// func (lb *LBManager) getNodeInternalIps(nodes []*v1.Node) []string {
-// 	nodeIps := make([]string, len(nodes))
-// 	for i, node := range nodes {
-// 		for _, addr := range node.Status.Addresses {
-// 			if addr.Type == v1.NodeInternalIP {
-// 				nodeIps[i] = addr.Address
-// 				break
-// 			}
-// 		}
-// 	}
-// 	return nodeIps
-// }
 
 func (lb *LBManager) getServicePortMap(service *v1.Service) (map[string]int32, map[string]int32, map[string]string) {
 	typeToInternalPort := make(map[string]int32)
@@ -260,9 +224,9 @@ func (lb *LBManager) UpdateLoadBalancer(ctx context.Context, clusterName string,
 		return fmt.Errorf("error while obtaining access token: [%v]", err)
 	}
 
-	// nodeIps := lb.getWorkerNodeInternalIps(nodes)
-
 	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	lb.ovdcNetworkName = ovdcNetworkName
+
 	nodeIps := lb.getNodeNetworkIps(ctx, nodes, ovdcNetworkName)
 
 	klog.Infof("UpdateLoadBalancer Node Ips: %v", nodeIps)
@@ -287,6 +251,10 @@ func (lb *LBManager) UpdateLoadBalancer(ctx context.Context, clusterName string,
 		if err != nil {
 			return fmt.Errorf("error while creating GatewayManager: [%v]", err)
 		}
+		// Définir le mode transparent pour le GatewayManager
+		useTransparentMode := lb.isTransparentModeEnabled(service)
+		gm.TransparentMode = useTransparentMode
+		
 		klog.Infof("Updating pool [%s] with port [%s:%d]", lbPoolName, portName, internalPort)
 		protocol, _ := nameToProtocol[portName]
 		resourcesAllocated := &util.AllocatedResourcesMap{}
@@ -344,7 +312,7 @@ func (lb *LBManager) EnsureLoadBalancerDeleted(ctx context.Context, clusterName 
 	if err := lb.vcdClient.RefreshBearerToken(); err != nil {
 		return fmt.Errorf("error while obtaining access token: [%v]", err)
 	}
-	return lb.deleteLoadBalancer(ctx, service)
+		return lb.deleteLoadBalancer(ctx, service)
 }
 
 func (lb *LBManager) getLoadBalancer(ctx context.Context,
@@ -466,52 +434,6 @@ func (lb *LBManager) getVirtualServicePrefix(_ context.Context, service *v1.Serv
 	return fmt.Sprintf("ingress-vs-%s-%s", service.Name, lb.getTrimmedClusterID())
 }
 
-func (lb *LBManager) GetStaticMembersGroupPrefix(serviceName, clusterID string) string {
-	return fmt.Sprintf("ingress-sg-%s-%s", serviceName, lb.getTrimmedClusterID(clusterID))
-}
-
-
-// deleteStaticMembersGroups supprime les groupes de membres statiques associés à un service
-func (lb *LBManager) deleteStaticMembersGroups(ctx context.Context, service *v1.Service) error {
-    // Vérifier que nous sommes bien en mode transparent
-    useTransparentMode := lb.isTransparentModeEnabled(service)
-    if !useTransparentMode {
-        klog.Infof("Service %s/%s is not in transparent mode, skipping static members groups deletion", 
-            service.Namespace, service.Name)
-        return nil
-    }
-    if lb.gatewayManager == nil {
-        ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
-        gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
-        if err != nil {
-            return fmt.Errorf("error while creating GatewayManager: [%v]", err)
-        }
-        gm.TransparentMode = useTransparentMode
-        lb.gatewayManager = gm
-    } else {
-        lb.gatewayManager.TransparentMode = useTransparentMode
-    }
-    
-    // Pour chaque port du service, supprimer le groupe de membres statiques correspondant
-    var lastError error
-    for _, port := range service.Spec.Ports {
-        staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
-            "-" + strconv.Itoa(int(port.Port))
-        
-        err := lb.gatewayManager.DeleteStaticMembersGroup(ctx, staticMembersGroupName, false)
-        if err != nil {
-            klog.Warningf("Failed to delete static members group %s: %v", staticMembersGroupName, err)
-            lastError = err
-            // Continuer malgré l'erreur pour nettoyer autant de ressources que possible
-        }
-    }
-    
-    return lastError
-}
-
-
-
-
 // getLoadBalancerIpClaimMarker returns a string comprising the service namespace, service name and
 // cluster Id, which allows CPI to uniquely mark an IP Allocation (from an Ip Space) being owned
 // by a particular service running on a specific cluster under a specific namespace
@@ -527,71 +449,77 @@ func (lb *LBManager) GetLoadBalancerName(ctx context.Context, clusterName string
 
 func (lb *LBManager) deleteLoadBalancer(ctx context.Context, service *v1.Service) error {
 
-	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
-	lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
-	virtualServiceName := lb.getVirtualServicePrefix(ctx, service)
-	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
-	klog.Infof("Deleting virtual service [%s] and lb pool [%s]", virtualServiceName, lbPoolNamePrefix)
+    ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	lb.ovdcNetworkName = ovdcNetworkName	
+    lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
+    virtualServiceName := lb.getVirtualServicePrefix(ctx, service)
+    lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
+    klog.Infof("Deleting virtual service [%s] and lb pool [%s]", virtualServiceName, lbPoolNamePrefix)
 
-	portDetailsList := make([]vcdsdk.PortDetails, len(service.Spec.Ports))
-	for idx, port := range service.Spec.Ports {
-		portDetailsList[idx] = vcdsdk.PortDetails{
-			PortSuffix:   port.Name,
-			ExternalPort: port.Port,
-			InternalPort: port.NodePort,
-			Protocol:     string(port.Protocol),
-			// no need to set UseSSL for deletion
-		}
-	}
-	klog.Infof("Deleting loadbalancer for ports [%#v]\n", portDetailsList)
+    portDetailsList := make([]vcdsdk.PortDetails, len(service.Spec.Ports))
+    for idx, port := range service.Spec.Ports {
+        portDetailsList[idx] = vcdsdk.PortDetails{
+            PortSuffix:   port.Name,
+            ExternalPort: port.Port,
+            InternalPort: port.NodePort,
+            Protocol:     string(port.Protocol),
+            // no need to set UseSSL for deletion
+        }
+    }
+    klog.Infof("Deleting loadbalancer for ports [%#v]\n", portDetailsList)
 
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
-	if err != nil {
-		return fmt.Errorf("error while creating GatewayManager: [%v]", err)
-	}
-	resourcesDeallocated := &util.AllocatedResourcesMap{}
-	vip, err := gm.DeleteLoadBalancer(ctx, virtualServiceName, lbPoolNamePrefix, lbIpClaimMarker, portDetailsList, lb.OneArm, resourcesDeallocated)
-	if rdeErr := lb.removeLBResourcesFromRDE(ctx, resourcesDeallocated); rdeErr != nil {
-		klog.Errorf("failed to remove loadbalancer resources from RDE [%s]: [%v]", lb.clusterID, rdeErr)
-		return fmt.Errorf("failed to remove loadbalancer resources from RDE [%s]: [%v]", lb.clusterID, rdeErr)
-	}
+    gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
+    if err != nil {
+        return fmt.Errorf("error while creating GatewayManager: [%v]", err)
+    }
+	// Définir le mode transparent pour le GatewayManager
+	useTransparentMode := lb.isTransparentModeEnabled(service)
+	gm.TransparentMode = useTransparentMode
 
-	cpiRdeManager := cpisdk.NewCPIRDEManager(vcdsdk.NewRDEManager(
-		lb.vcdClient, lb.clusterID, release.CloudControllerManagerName, release.Version))
 
-	if err != nil {
-		addToErrorSetErr := cpiRdeManager.AddToErrorSetWithNameAndId(ctx, cpisdk.DeleteLoadbalancerError, "", virtualServiceName, err.Error())
-		if addToErrorSetErr != nil {
-			klog.Errorf("error adding CPI error [%s] to RDE: [%s], [%v]", cpisdk.DeleteLoadbalancerError, lb.clusterID, addToErrorSetErr)
-		}
-		return fmt.Errorf("unable to delete load balancer for virtual-service [%s] and lb pool [%s]: [%v]",
-			virtualServiceName, lbPoolNamePrefix, err)
-	}
+    resourcesDeallocated := &util.AllocatedResourcesMap{}
+    vip, err := gm.DeleteLoadBalancer(ctx, virtualServiceName, lbPoolNamePrefix, lbIpClaimMarker, portDetailsList, lb.OneArm, resourcesDeallocated)
+    if rdeErr := lb.removeLBResourcesFromRDE(ctx, resourcesDeallocated); rdeErr != nil {
+        klog.Errorf("failed to remove loadbalancer resources from RDE [%s]: [%v]", lb.clusterID, rdeErr)
+        return fmt.Errorf("failed to remove loadbalancer resources from RDE [%s]: [%v]", lb.clusterID, rdeErr)
+    }
 
-	if err := cpiRdeManager.RemoveVirtualIpFromRDE(ctx, vip); err != nil {
-		addToErrorSetErr := cpiRdeManager.AddToErrorSet(ctx, cpisdk.RemoveVIPFromRdeError, lb.clusterID, err.Error())
-		if addToErrorSetErr != nil {
-			klog.Errorf("unable to add CPI error [%s] to RDE: [%s], [%v]", cpisdk.RemoveVIPFromRdeError, lb.clusterID, addToErrorSetErr)
-		}
-		klog.Errorf("failed to remove virtual IP [%s] from the RDE [%s]: [%v]", vip, lb.clusterID, err)
-	}
+    cpiRdeManager := cpisdk.NewCPIRDEManager(vcdsdk.NewRDEManager(
+        lb.vcdClient, lb.clusterID, release.CloudControllerManagerName, release.Version))
 
-	err = cpiRdeManager.RDEManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCPI, cpisdk.RemoveVIPFromRdeError, lb.clusterID, "")
-	if err != nil {
-		klog.Errorf("error removing CPI error [%s] from RDE [%s]: [%v]", cpisdk.RemoveVIPFromRdeError, lb.clusterID, err)
-	}
+    if err != nil {
+        addToErrorSetErr := cpiRdeManager.AddToErrorSetWithNameAndId(ctx, cpisdk.DeleteLoadbalancerError, "", virtualServiceName, err.Error())
+        if addToErrorSetErr != nil {
+            klog.Errorf("error adding CPI error [%s] to RDE: [%s], [%v]", cpisdk.DeleteLoadbalancerError, lb.clusterID, addToErrorSetErr)
+        }
+        return fmt.Errorf("unable to delete load balancer for virtual-service [%s] and lb pool [%s]: [%v]",
+            virtualServiceName, lbPoolNamePrefix, err)
+    }
 
-	err = cpiRdeManager.AddToEventSetWithNameAndId(ctx, cpisdk.DeletedLoadbalancer, "", virtualServiceName, fmt.Sprintf("Successfully deleted loadbalancer associated with [%s], deleted external IP [%s]", lb.clusterID, vip))
-	if err != nil {
-		klog.Errorf("error adding CPI event [%s] to RDE: [%v]", cpisdk.DeletedLoadbalancer, err)
-	}
+    if err := cpiRdeManager.RemoveVirtualIpFromRDE(ctx, vip); err != nil {
+        addToErrorSetErr := cpiRdeManager.AddToErrorSet(ctx, cpisdk.RemoveVIPFromRdeError, lb.clusterID, err.Error())
+        if addToErrorSetErr != nil {
+            klog.Errorf("unable to add CPI error [%s] to RDE: [%s], [%v]", cpisdk.RemoveVIPFromRdeError, lb.clusterID, addToErrorSetErr)
+        }
+        klog.Errorf("failed to remove virtual IP [%s] from the RDE [%s]: [%v]", vip, lb.clusterID, err)
+    }
 
-	err = cpiRdeManager.RDEManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCPI, cpisdk.DeleteLoadbalancerError, "", virtualServiceName)
-	if err != nil {
-		klog.Errorf("there was an error removing CPI error [%s] from RDE [%s], [%v]", cpisdk.DeleteLoadbalancerError, lb.clusterID, err)
-	}
+    err = cpiRdeManager.RDEManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCPI, cpisdk.RemoveVIPFromRdeError, lb.clusterID, "")
+    if err != nil {
+        klog.Errorf("error removing CPI error [%s] from RDE [%s]: [%v]", cpisdk.RemoveVIPFromRdeError, lb.clusterID, err)
+    }
 
-	return nil
+    err = cpiRdeManager.AddToEventSetWithNameAndId(ctx, cpisdk.DeletedLoadbalancer, "", virtualServiceName, fmt.Sprintf("Successfully deleted loadbalancer associated with [%s], deleted external IP [%s]", lb.clusterID, vip))
+    if err != nil {
+        klog.Errorf("error adding CPI event [%s] to RDE: [%v]", cpisdk.DeletedLoadbalancer, err)
+    }
+
+    err = cpiRdeManager.RDEManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCPI, cpisdk.DeleteLoadbalancerError, "", virtualServiceName)
+    if err != nil {
+        klog.Errorf("there was an error removing CPI error [%s] from RDE [%s], [%v]", cpisdk.DeleteLoadbalancerError, lb.clusterID, err)
+    }
+
+    return nil
 }
 
 func getSSLPorts(service *v1.Service) ([]int32, error) {
@@ -636,42 +564,15 @@ func getUserSpecifiedLoadBalancerIP(service *v1.Service) string {
 	return service.Spec.LoadBalancerIP
 }
 
-// getVMIDForNode récupère l'ID de la VM pour un nœud Kubernetes
-func (lb *LBManager) getVMIDForNode(ctx context.Context, node *v1.Node) (string, error) {
-    providerID := node.Spec.ProviderID
-    if providerID == "" {
-        return "", fmt.Errorf("node %s has no providerID", node.Name)
-    }
-
-    // Le format du providerID est généralement: vcd://<org>/<vdc>/<vm-id>
-    // Extraire l'ID de la VM
-    parts := strings.Split(providerID, "/")
-    if len(parts) < 4 {
-        return "", fmt.Errorf("invalid providerID format for node %s: %s", node.Name, providerID)
-    }
-    vmID := parts[len(parts)-1]
-
-    // Vérifier que l'ID de la VM est valide
-    if vmID == "" {
-        return "", fmt.Errorf("empty VM ID extracted from providerID for node %s: %s", node.Name, providerID)
-    }
-
-    return vmID, nil
-}
-
-
 func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service,
 	nodeIPs []string) (*v1.LoadBalancerStatus, error) {
 	
-	useTransparentMode := lb.isTransparentModeEnabled(service)
-	
-	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName) // toto
+	ovdcNetworkName := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerNetworkName, lb.ovdcNetworkName)
+	lb.ovdcNetworkName = ovdcNetworkName
 	lbIpClaimMarker := lb.getLoadBalancerIpClaimMarker(ctx, service)
 	lbPoolNamePrefix := lb.getLBPoolNamePrefix(ctx, service)
 	virtualServiceNamePrefix := lb.getVirtualServicePrefix(ctx, service)
 	lbStatus, portNameToIPMap, err := lb.getLoadBalancer(ctx, service)
-	//juste pour voir : 
-	TransparentMode := getStringFromServiceAnnotation(service, ServiceAnnotationTransparentMode, lb.TransparentMode)
 
 	rdeManager := vcdsdk.NewRDEManager(lb.vcdClient, lb.clusterID, release.CloudControllerManagerName, release.Version)
 	cpiRdeManager := cpisdk.NewCPIRDEManager(rdeManager)
@@ -688,12 +589,14 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	if removeErr != nil {
 		klog.Errorf("error adding CPI error [%s] to the RDE [%s], [%v]", cpisdk.GetLoadbalancerError, lb.clusterID, removeErr)
 	}
-	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName) // toto
+	gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
 	if err != nil {
 		return nil, fmt.Errorf("error while creating GatewayManager: [%v]", err)
 	}
-
+	// Définir le mode transparent pour le GatewayManager
+	useTransparentMode := lb.isTransparentModeEnabled(service)
 	gm.TransparentMode = useTransparentMode
+
 	lb.gatewayManager = gm
 
 	// golang doesn't have the set data structure
@@ -712,41 +615,6 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	klog.Infof("createLoadBalancer called with loadBalancerIP [%s] for service [%s]", userSpecifiedLBIP, service.Name)
 
 	if lbExists {
-		if useTransparentMode && lb.nodesForTransparentMode != nil {
-			// Pour chaque port, mettre à jour le groupe de membres statiques
-			for _, port := range service.Spec.Ports {
-				staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
-					"-" + strconv.Itoa(int(port.Port))
-				
-				// Collecter les IDs des VMs des nœuds
-				vmIDs := make([]string, 0, len(lb.nodesForTransparentMode))
-				for _, node := range lb.nodesForTransparentMode {
-					// Obtenir l'ID de la VM pour ce nœud
-					vmID, err := lb.getVMIDForNode(ctx, node)
-					if err != nil {
-						return nil, fmt.Errorf("failed to get VM ID for node %s: %v", node.Name, err)
-					}
-					vmIDs = append(vmIDs, vmID)
-				}
-				
-				_, err := gm.CreateOrUpdateStaticMembersGroup(ctx, staticMembersGroupName, vmIDs)
-				if err != nil {
-					return nil, fmt.Errorf("failed to update static members group for service %s/%s port %d: %v",
-						service.Namespace, service.Name, port.Port, err)
-				}
-			}
-			
-			// Recréer le statut du load balancer
-			lbStatus, _, err = lb.getLoadBalancer(ctx, service)
-			if err != nil {
-				addToErrorSetErr := cpiRdeManager.AddToErrorSetWithNameAndId(ctx, cpisdk.GetLoadbalancerError, "", virtualServiceNamePrefix, err.Error())
-				if addToErrorSetErr != nil {
-					klog.Errorf("error adding CPI error [%s] to the RDE [%s], [%v]", cpisdk.GetLoadbalancerError, lb.clusterID, addToErrorSetErr)
-				}
-				return nil, fmt.Errorf("unexpected error while querying for loadbalancer after updating load balancer: [%v]", err)
-			}
-			return lbStatus, nil
-		}
 		// Update load balancer if there are changes in service properties
 		typeToInternalPortMap, typeToExternalPortMap, nameToProtocol := lb.getServicePortMap(service)
 		for portName, internalPort := range typeToInternalPortMap {
@@ -835,81 +703,27 @@ func (lb *LBManager) createLoadBalancer(ctx context.Context, service *v1.Service
 	for _, port := range ports {
 		portsMap[port] = true
 	}
-
-	if useTransparentMode && lb.nodesForTransparentMode != nil {
-		for idx, port := range service.Spec.Ports {
-			// Créer un groupe de membres statiques pour ce port
-			staticMembersGroupName := vcdsdk.GetStaticMembersGroupPrefix(service.Name, lb.clusterID) + 
-				"-" + strconv.Itoa(int(port.Port))
-			
-			// Collecter les IDs des VMs des nœuds
-			vmIDs := make([]string, 0, len(lb.nodesForTransparentMode))
-			for _, node := range lb.nodesForTransparentMode {
-				// Obtenir l'ID de la VM pour ce nœud
-				vmID, err := lb.getVMIDForNode(ctx, node)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get VM ID for node %s: %v", node.Name, err)
-				}
-				vmIDs = append(vmIDs, vmID)
-			}
-			
-			// Créer le groupe de membres statiques
-			staticMembersGroupID, err := gm.CreateOrUpdateStaticMembersGroup(ctx, staticMembersGroupName, vmIDs)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create static members group for service %s/%s port %d: %v",
-					service.Namespace, service.Name, port.Port, err)
-			}
-			
-			// Préparer les détails du port
-			portDetailsList[idx] = vcdsdk.PortDetails{
-				PortSuffix:		   port.Name,
-				ExternalPort:		 port.Port,
-				InternalPort:		 port.NodePort,
-				Protocol:			 strings.ToUpper(string(port.Protocol)),
-				StaticMembersGroupID: staticMembersGroupID,
-				UseStaticMembersGroup: true,
-			}
-			if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
-				switch strings.ToUpper(*port.AppProtocol) {
-				// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
-				case "HTTP", "HTTPS", "TCP":
-					portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
-				}
-			}
-			
-			if _, ok := portsMap[port.Port]; ok {
-				if !skipAviSSLTermination {
-					portDetailsList[idx].UseSSL = true
-					if certAlias == "" {
-						return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
-					}
-					portDetailsList[idx].CertAlias = certAlias
-				}
+	for idx, port := range service.Spec.Ports {
+		portDetailsList[idx] = vcdsdk.PortDetails{
+			PortSuffix:   port.Name,
+			ExternalPort: port.Port,
+			InternalPort: port.NodePort,
+			Protocol:     strings.ToUpper(string(port.Protocol)),
+		}
+		if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
+			switch strings.ToUpper(*port.AppProtocol) {
+			// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
+			case "HTTP", "HTTPS", "TCP":
+				portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
 			}
 		}
-	} else {
-		for idx, port := range service.Spec.Ports {
-			portDetailsList[idx] = vcdsdk.PortDetails{
-				PortSuffix:   port.Name,
-				ExternalPort: port.Port,
-				InternalPort: port.NodePort,
-				Protocol:	 strings.ToUpper(string(port.Protocol)),
-			}
-			if port.AppProtocol != nil && *port.AppProtocol != "" && !skipAviSSLTermination {
-				switch strings.ToUpper(*port.AppProtocol) {
-				// allow override in case of known protocols such as HTTP/HTTPS/TCP which are directly supported in Avi
-				case "HTTP", "HTTPS", "TCP":
-					portDetailsList[idx].Protocol = strings.ToUpper(*port.AppProtocol)
+		if _, ok := portsMap[port.Port]; ok {
+			if !skipAviSSLTermination {
+				portDetailsList[idx].UseSSL = true
+				if certAlias == "" {
+					return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
 				}
-			}
-			if _, ok := portsMap[port.Port]; ok {
-				if !skipAviSSLTermination {
-					portDetailsList[idx].UseSSL = true
-					if certAlias == "" {
-						return nil, fmt.Errorf("cert alias empty while port [%d] for SSL is specified", port.Port)
-					}
-					portDetailsList[idx].CertAlias = certAlias
-				}
+				portDetailsList[idx].CertAlias = certAlias
 			}
 		}
 	}
