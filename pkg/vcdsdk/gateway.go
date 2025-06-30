@@ -47,6 +47,19 @@ type GatewayManager struct {
 }
 
 // CacheGatewayDetails get gateway reference and cache some details in client object
+
+func (gm *GatewayManager) GetLoadBalancerConfig(ctx context.Context, ) error {
+	client := gm.Client
+	//(ctx context.Context, gatewayId string) (EdgeGatewayLoadBalancerConfig, *http.Response, error)
+	lbConfig, resp, err := client.APIClient.EdgeGatewayLoadBalancerApi.GetLoadBalancerConfig(ctx, gm.GatewayRef.Id)
+	if err != nil {
+		return fmt.Errorf("error while creating GatewayManager: [%+v]: [%v]", resp, err)
+	}
+	klog.Infof("Current lb transparentMod : %v", lbConfig.TransparentModeEnabled)
+	return nil
+}
+
+
 func (gm *GatewayManager) cacheGatewayDetails(ctx context.Context, ovdcName string) error {
 	if gm.NetworkName == "" {
 		return fmt.Errorf("network name should not be empty")
@@ -993,13 +1006,15 @@ func (gm *GatewayManager) DeleteLoadBalancerPool(ctx context.Context, lbPoolName
 	// Dans le cas du mode transparent, il faut aussi détruire l'IpSet
 	if gm.TransparentMode {
 		ipSetName:=GetIPSetName(lbPoolName);
+		klog.Infof("Try to delete IPSet [%s]\n", ipSetName)
         err = gm.DeleteIPSet(ctx, ipSetName, false)
         if err != nil {
-        	klog.Warningf("Failed to delete IP Set %s: %v", ipSetName, err)
+        	klog.Warningf("Failed to delete IPSet %s: %v", ipSetName, err)
             // Continuer malgré l'erreur pour nettoyer autant de ressources que possible
-        }
+        } else {
+			klog.Infof("Deleted IPSet [%s]\n", ipSetName)
+		}
 	}
-
 	return nil
 }
 
@@ -1302,6 +1317,8 @@ func (gm *GatewayManager) UpdateVirtualService(ctx context.Context, virtualServi
 		// update the virtual IP address of the virtual service when one arm is nil
 		vs.VirtualIpAddress = virtualServiceIP
 	}
+	vs.TransparentModeEnabled = gm.TransparentMode
+
 	resp, err := client.APIClient.EdgeGatewayLoadBalancerVirtualServiceApi.UpdateVirtualService(ctx, vs, vsSummary.Id, org.Org.ID)
 	if resp != nil && resp.StatusCode != http.StatusAccepted {
 		var responseMessageBytes []byte
@@ -1389,10 +1406,12 @@ func (gm *GatewayManager) CreateVirtualService(ctx context.Context, virtualServi
 		ApplicationProfile: &swaggerClient.EdgeLoadBalancerApplicationProfile{
 			SystemDefined: true,
 		},
+		TransparentModeEnabled: gm.TransparentMode,
 	}
 	switch vsType {
 	case "TCP":
-		virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
+		// invalid Application Profile System-L4-Application
+		// virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
 		virtualServiceConfig.ApplicationProfile.Type_ = "L4"
 		if useSSL {
 			virtualServiceConfig.ApplicationProfile.Name = "System-SSL-Application"
@@ -1411,7 +1430,8 @@ func (gm *GatewayManager) CreateVirtualService(ctx context.Context, virtualServi
 		break
 	
 	case "UDP":
-		virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
+		// invalid Application Profile System-L4-Application
+		// virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
 		virtualServiceConfig.ApplicationProfile.Type_ = "L4"
 		virtualServiceConfig.ServicePorts = []swaggerClient.EdgeLoadBalancerServicePort{
 			{

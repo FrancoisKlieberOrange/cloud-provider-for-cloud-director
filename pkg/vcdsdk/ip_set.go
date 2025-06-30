@@ -3,6 +3,8 @@ package vcdsdk
 import (
     "context"
     "fmt"
+    "strings"
+    "time"
     "github.com/vmware/go-vcloud-director/v2/govcd"
     "github.com/vmware/go-vcloud-director/v2/types/v56"
     "k8s.io/klog"
@@ -144,14 +146,34 @@ func (gm *GatewayManager) DeleteIPSet(ctx context.Context, ipSetName string, fai
         }
         return fmt.Errorf("error getting IP Set [%s]: [%v]", ipSetName, err)
     }
+    maxRetries := 5
+    retryDelay := 20 * time.Second
+    var lastErr error
     
-    err = ipSet.Delete()
-    if err != nil {
-        return fmt.Errorf("unable to delete IP Set [%s]: [%v]", ipSetName, err)
+    for attempt := 1; attempt <= maxRetries; attempt++ {
+        err = ipSet.Delete()
+        if err == nil {
+            klog.Infof("Successfully deleted IP Set [%s] on attempt %d", ipSetName, attempt)
+            return nil
+        }
+        lastErr = err
+        if strings.Contains(err.Error(), "cannot be deleted as it is in use.") {
+            if attempt < maxRetries {
+                klog.Warningf("IP Set [%s] is in use, retrying in %v (attempt %d/%d): %v", 
+                    ipSetName, retryDelay, attempt, maxRetries, err)
+                time.Sleep(retryDelay)
+                continue
+            }
+        } else {
+            // Si ce n'est pas l'erreur spécifique, retourner immédiatement
+            return fmt.Errorf("unable to delete IP Set [%s]: [%v]", ipSetName, err)
+        }
     }
-    
-    return nil
+    // Si on arrive ici, c'est que toutes les tentatives ont échoué avec l'erreur "in use"
+    return fmt.Errorf("unable to delete IP Set [%s] after %d attempts: [%v]", 
+        ipSetName, maxRetries, lastErr)
 }
+
 
 // GetNsxtEdgeGateway récupère la passerelle NSX-T Edge
 func (gm *GatewayManager) GetNsxtEdgeGateway() (*govcd.NsxtEdgeGateway, error) {
