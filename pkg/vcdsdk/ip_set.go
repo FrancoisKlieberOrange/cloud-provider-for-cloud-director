@@ -10,7 +10,6 @@ import (
     "k8s.io/klog"
 )
 
-// CreateOrUpdateIPSet crée ou met à jour un IP Set avec les adresses IP spécifiées
 func (gm *GatewayManager) CreateOrUpdateIPSet(ctx context.Context, ipSetName string, ipAddresses []string) (string, error) {
     client := gm.Client
     if client == nil || client.VCDClient == nil {
@@ -25,14 +24,14 @@ func (gm *GatewayManager) CreateOrUpdateIPSet(ctx context.Context, ipSetName str
         return "", fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
     }
 
-    // Vérifier si l'IP Set existe déjà
+    // Check if IP Set already exists
     existingIpSet, err := org.GetNsxtFirewallGroupByName(ipSetName, types.FirewallGroupTypeIpSet)
     if err != nil && !govcd.ContainsNotFound(err) {
         return "", fmt.Errorf("error checking for existing IP Set [%s]: [%v]", ipSetName, err)
     }
-//       Check si creation de POOOOOOOOOOOOOOOOOOOOOOOOOOOOL
+
     if existingIpSet != nil && existingIpSet.NsxtFirewallGroup != nil {
-        // Mettre à jour l'IP Set existant
+        // Update existing IP Set
         existingIpSet.NsxtFirewallGroup.IpAddresses = ipAddresses
         existingIpSet.NsxtFirewallGroup.Description = "IP Set for Kubernetes service load balancer"
         
@@ -43,7 +42,7 @@ func (gm *GatewayManager) CreateOrUpdateIPSet(ctx context.Context, ipSetName str
         
         return updatedIpSet.NsxtFirewallGroup.ID, nil
     } else {
-        // Créer un nouvel IP Set
+        // Create new IP Set
         edge, err := gm.GetNsxtEdgeGateway()
         if err != nil {
             return "", fmt.Errorf("unable to get NSX-T Edge Gateway: [%v]", err)
@@ -56,7 +55,7 @@ func (gm *GatewayManager) CreateOrUpdateIPSet(ctx context.Context, ipSetName str
             OwnerRef:    &types.OpenApiReference{ID: edge.EdgeGateway.ID},
             IpAddresses: ipAddresses,
         }
-        // Creation d'un pool de trop ????????
+
         createdIpSet, err := edge.CreateNsxtFirewallGroup(ipSetDefinition)
         if err != nil {
             return "", fmt.Errorf("unable to create IP Set [%s]: [%v]", ipSetName, err)
@@ -71,7 +70,7 @@ func GetIPSetName(lbPoolName string) string {
 }
 
 
-// GetIPSetByName récupère un IP Set par son nom
+
 func (gm *GatewayManager) GetIPSetByName(ctx context.Context, ipSetName string) (*types.NsxtFirewallGroup, error) {
     client := gm.Client
     if client == nil || client.VCDClient == nil {
@@ -97,7 +96,6 @@ func (gm *GatewayManager) GetIPSetByName(ctx context.Context, ipSetName string) 
     return ipSet.NsxtFirewallGroup, nil
 }
 
-// GetIPSet récupère un IP Set par son ID
 func (gm *GatewayManager) GetIPSet(ctx context.Context, ipSetID string) (*types.NsxtFirewallGroup, error) {
     client := gm.Client
     if client == nil || client.VCDClient == nil {
@@ -120,7 +118,6 @@ func (gm *GatewayManager) GetIPSet(ctx context.Context, ipSetID string) (*types.
     return ipSet.NsxtFirewallGroup, nil
 }
 
-// DeleteIPSet supprime un IP Set par son nom
 func (gm *GatewayManager) DeleteIPSet(ctx context.Context, ipSetName string, failIfAbsent bool) error {
     client := gm.Client
     if client == nil || client.VCDClient == nil {
@@ -165,17 +162,16 @@ func (gm *GatewayManager) DeleteIPSet(ctx context.Context, ipSetName string, fai
                 continue
             }
         } else {
-            // Si ce n'est pas l'erreur spécifique, retourner immédiatement
+            // If this is not the specific error, we return without a new try
             return fmt.Errorf("unable to delete IP Set [%s]: [%v]", ipSetName, err)
         }
     }
-    // Si on arrive ici, c'est que toutes les tentatives ont échoué avec l'erreur "in use"
+    // All tries failed with the error 'in use'.
     return fmt.Errorf("unable to delete IP Set [%s] after %d attempts: [%v]", 
         ipSetName, maxRetries, lastErr)
 }
 
 
-// GetNsxtEdgeGateway récupère la passerelle NSX-T Edge
 func (gm *GatewayManager) GetNsxtEdgeGateway() (*govcd.NsxtEdgeGateway, error) {
     client := gm.Client
     if client == nil || client.VCDClient == nil {
@@ -190,13 +186,11 @@ func (gm *GatewayManager) GetNsxtEdgeGateway() (*govcd.NsxtEdgeGateway, error) {
         return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
     }
 
-    // Récupérer le VDC
     vdc, err := org.GetVDCByName(client.ClusterOVDCName, false)
     if err != nil {
         return nil, fmt.Errorf("unable to get VDC [%s]: [%v]", client.ClusterOVDCName, err)
     }
 
-    // Récupérer la passerelle Edge par son nom
     edge, err := vdc.GetNsxtEdgeGatewayByName(gm.GatewayRef.Name)
     if err != nil {
         return nil, fmt.Errorf("unable to get NSX-T Edge Gateway [%s]: [%v]", gm.GatewayRef.Name, err)

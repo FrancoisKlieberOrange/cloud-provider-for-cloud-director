@@ -50,7 +50,6 @@ type GatewayManager struct {
 
 func (gm *GatewayManager) GetLoadBalancerConfig(ctx context.Context, ) error {
 	client := gm.Client
-	//(ctx context.Context, gatewayId string) (EdgeGatewayLoadBalancerConfig, *http.Response, error)
 	lbConfig, resp, err := client.APIClient.EdgeGatewayLoadBalancerApi.GetLoadBalancerConfig(ctx, gm.GatewayRef.Id)
 	if err != nil {
 		return fmt.Errorf("error while creating GatewayManager: [%+v]: [%v]", resp, err)
@@ -758,21 +757,19 @@ func (gm *GatewayManager) updateLoadBalancerPoolWithIPSet (ctx context.Context, 
     lbPool.DefaultPort = int32(internalPort)
     lbPool.GracefulTimeoutPeriod = DefaultLbPoolGracefulTimeoutPeriod
        
-    // Mettre à jour le pool - cette fonction retourne seulement resp et err
     resp, err = client.APIClient.EdgeGatewayLoadBalancerPoolApi.UpdateLoadBalancerPool(ctx, lbPool, poolId, clusterOrgOrgID)
     if err != nil {
 		klog.Warningf("Unable to update LB pool [%s] with IP Set: [%+v]: [%v]",
         lbPoolName, resp, err)
         return resp, err
     }
-    // Rien à retourner car la référence existante n'a pas été mise à jour, seulson contenu
     return resp, nil
 }
 
 func (gm *GatewayManager)  createLoadBalancerPoolWithIPSet (ctx context.Context, lbPoolName string,
 	ipSetRef *swaggerClient.EntityReference, internalPort int32, clusterOrgOrgID string) (*http.Response, error) {
 	client := gm.Client
-		// Créer un nouveau pool avec l'IP Set
+	// Create new pool with IP Set
     createPoolParams := &swaggerClient.EdgeLoadBalancerPool{
             Name:                  lbPoolName,
             Enabled:               true,
@@ -790,7 +787,7 @@ func (gm *GatewayManager)  createLoadBalancerPoolWithIPSet (ctx context.Context,
 			return nil, err
      }
         
-        // Après la création, récupérer le pool créé pour obtenir son ID
+    // Get pool id after creation
     createdPool, err := gm.GetLoadBalancerPool(ctx, lbPoolName)
     if err != nil {
         klog.Warningf("Pool was created but unable to retrieve it: [%v]", err)
@@ -812,13 +809,12 @@ func (gm *GatewayManager) createOrUpdateLoadBalancerPoolWithIPSet(ctx context.Co
         return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
     }
     
-    // Vérifier si le pool existe déjà
+    // Check if pool exists
     existingPool, err := gm.GetLoadBalancerPool(ctx, lbPoolName)
     if err != nil && err != govcd.ErrorEntityNotFound {
         return nil, fmt.Errorf("error checking for existing LB pool [%s]: [%v]", lbPoolName, err)
     }
     
-    // Récupérer l'IP Set pour obtenir sa référence
     ipSet, err := gm.GetIPSet(ctx, ipSetID)
     if err != nil {
         return nil, fmt.Errorf("unable to get IP Set with ID [%s]: [%v]", ipSetID, err)
@@ -830,14 +826,14 @@ func (gm *GatewayManager) createOrUpdateLoadBalancerPoolWithIPSet(ctx context.Co
     }
     
     if existingPool != nil {
-        // Mettre à jour le pool existant pour utiliser l'IP Set
+        // Update existing pool
 		resp, err := gm.updateLoadBalancerPoolWithIPSet(ctx, lbPoolName, existingPool.Id, ipSetRef, internalPort, clusterOrg.Org.ID) 
 		if err != nil {
 			return nil, err
 		}
 		klog.Infof("Pool %s was updated", existingPool)
         return resp, nil
-    } //else {
+    }
 	resp, err:= gm.createLoadBalancerPoolWithIPSet(ctx, lbPoolName, ipSetRef, internalPort, clusterOrg.Org.ID) 
     if err != nil {
         return nil, fmt.Errorf("Error when trying to create pool: [%v]", err)
@@ -906,9 +902,8 @@ func (gm *GatewayManager) CreateLoadBalancerPool(ctx context.Context, lbPoolName
 	}
 	lbPoolUniqueIPList := util.NewSet(lbPoolIPList).GetElements()
 	var resp *http.Response = nil
-	// dans le cas du mode non transparent :
+	// Transparent mode :
 	if gm.TransparentMode {
-		// Si nous sommes en mode transparent, nous utilisons les IP Sets au lieu des membres directs du pool (lbPoolMembers = nil)
 		ipSetName:=GetIPSetName(lbPoolName);
 		ipSetID, err := gm.CreateOrUpdateIPSet(ctx, ipSetName, lbPoolUniqueIPList)
 		if err != nil {
@@ -1003,14 +998,14 @@ func (gm *GatewayManager) DeleteLoadBalancerPool(ctx context.Context, lbPoolName
 	}
 	klog.Infof("Deleted loadbalancer pool [%s]\n", lbPoolName)
 
-	// Dans le cas du mode transparent, il faut aussi détruire l'IpSet
+	// In transparent mode we have also to delete ip set
 	if gm.TransparentMode {
 		ipSetName:=GetIPSetName(lbPoolName);
 		klog.Infof("Try to delete IPSet [%s]\n", ipSetName)
         err = gm.DeleteIPSet(ctx, ipSetName, false)
         if err != nil {
         	klog.Warningf("Failed to delete IPSet %s: %v", ipSetName, err)
-            // Continuer malgré l'erreur pour nettoyer autant de ressources que possible
+            // Continue to clean even if there is any error
         } else {
 			klog.Infof("Deleted IPSet [%s]\n", ipSetName)
 		}
@@ -1035,7 +1030,7 @@ func hasSameLBPoolMembers(array1 [] string, array2 []string) bool {
 }
 
 
-// @TOTEST
+
 func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName string, lbPoolIPList []string,
 	internalPort int32, protocol string) (*swaggerClient.EntityReference, error) {
 	client := gm.Client
@@ -1064,7 +1059,7 @@ func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName
 	}
 
 	lbPoolUniqueIPList := util.NewSet(lbPoolIPList).GetElements()
-	// on verifie si il y a une modification du pool
+	// Check if pool need to be update
 	membersIPs, err :=gm.GetLoadBalancerPoolMemberIPs(ctx, lbPoolRef);
 	if err != nil {
 		return nil, fmt.Errorf("unable to get loadbalancer pool members IPs, for pool id [%s] : [%v]", lbPoolRef.Id, err)
@@ -1093,9 +1088,8 @@ func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName
 		healthMonitor = &swaggerClient.EdgeLoadBalancerHealthMonitor{Type_: protocol}
 	}
 
-	// dans le cas du mode non transparent :
+	// Transparent mode :
 	if gm.TransparentMode {
-		// Si nous sommes en mode transparent, nous utilisons les IP Sets au lieu des membres directs du pool (lbPoolMembers = nil)
 		ipSetName:=GetIPSetName(lbPoolName);
 		ipSetID, err := gm.CreateOrUpdateIPSet(ctx, ipSetName, lbPoolUniqueIPList)
 		if err != nil {
@@ -1714,22 +1708,21 @@ func (gm *GatewayManager) GetLoadBalancerPoolMemberIPs(ctx context.Context, lbPo
             lbPoolRef.Name, resp, err)
     }
 
-    // Si le pool utilise un groupe de membres (IP Set), récupérer les IPs depuis l'IP Set
+    // In transparent mode we need to get IPs from IPSet
     if gm.TransparentMode && lbPool.MemberGroupRef != nil && lbPool.MemberGroupRef.Id != "" {
-        // Utiliser la fonction définie dans ip_set.go
         ipSet, err := gm.GetIPSet(ctx, lbPool.MemberGroupRef.Id)
         if err != nil {
             return nil, fmt.Errorf("unable to get IP Set [%s] for LB pool [%s]: [%v]",
                 lbPool.MemberGroupRef.Name, lbPoolRef.Name, err)
         }
         
-        // Extraire les IPs de l'IP Set
+        // get IPs from IP Set
         return ipSet.IpAddresses, nil
     } else if gm.TransparentMode && lbPool.MemberGroupRef == nil {
-		// si on veux passer en transparent et qu'on ne l'était pas on renvoit un tableau vide
+		// If we are changing from non transparent to transparent mode we return an empty array
 		return make([]string, 0), nil
 	}
-    // Sinon, utiliser les membres directs du pool
+    // else we use IPs of pools members
     memberIPs := make([]string, lbPool.MemberCount)
     members := lbPool.Members
     for i, member := range members {
@@ -1738,7 +1731,7 @@ func (gm *GatewayManager) GetLoadBalancerPoolMemberIPs(ctx context.Context, lbPo
     return memberIPs, nil
 }
 
-// GetLoadBalancerPoolRef récupère la référence d'un pool de load balancer par son nom
+// GetLoadBalancerPoolRef get pool ref from its name
 func (gm *GatewayManager) GetLoadBalancerPoolRef(ctx context.Context, lbPoolName string) (*swaggerClient.EntityReference, error) {
     return gm.GetLoadBalancerPool(ctx, lbPoolName)
 }
@@ -2196,47 +2189,6 @@ func (gm *GatewayManager) UpdateLoadBalancer(ctx context.Context, lbPoolName str
 	}
 	return vsSummary.VirtualIpAddress, nil
 }
-
-// updateIPSets met à jour les IP Sets pour un service en mode transparent
-// func (lb *LBManager) updateIPSets(ctx context.Context, service *v1.Service, nodes []*v1.Node) error {
-// 	if lb.gatewayManager == nil {
-// 		gm, err := vcdsdk.NewGatewayManager(ctx, lb.vcdClient, lb.ovdcNetworkName, lb.ipamSubnet, lb.ovdcName)
-// 		if err != nil {
-// 			return fmt.Errorf("error while creating GatewayManager: [%v]", err)
-// 		}
-// 		gm.TransparentMode = true
-// 		lb.gatewayManager = gm
-// 	} else {
-// 		lb.gatewayManager.TransparentMode = true
-// 	}
-
-// 	// Collecter les adresses IP des nœuds
-// 	nodeIPs := make([]string, 0, len(nodes))
-// 	for _, node := range nodes {
-// 		for _, addr := range node.Status.Addresses {
-// 			if addr.Type == v1.NodeInternalIP {
-// 				nodeIPs = append(nodeIPs, addr.Address)
-// 				break
-// 			}
-// 		}
-// 	}
-
-// 	// Pour chaque port du service, mettre à jour l'IP Set correspondant
-// 	for _, port := range service.Spec.Ports {
-// 		// @TODO GetIPSetPrefix n'existe pas ici
-// 		ipSetName := lb.GetIPSetPrefix(service.Name, lb.clusterID) + 
-// 			"-" + strconv.Itoa(int(port.Port))
-		
-// 		_, err := lb.gatewayManager.CreateOrUpdateIPSet(ctx, ipSetName, nodeIPs)
-// 		if err != nil {
-// 			return fmt.Errorf("failed to update IP Set for service %s/%s port %d: %v",
-// 				service.Namespace, service.Name, port.Port, err)
-// 		}
-// 	}
-	
-// 	return nil
-// }
-
 
 // FetchIpSpacesBackingGateway Fetch list of Ip Spaces (Id) accessible to the gateway
 // If gateway is not using Ip Spaces, error would be generated that will contain the underlying VCD 403 error.
