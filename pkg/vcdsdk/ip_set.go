@@ -43,20 +43,35 @@ func (gm *GatewayManager) CreateOrUpdateIPSet(ctx context.Context, ipSetName str
         return updatedIpSet.NsxtFirewallGroup.ID, nil
     } else {
         // Create new IP Set
-        edge, err := gm.GetNsxtEdgeGateway()
-        if err != nil {
-            return "", fmt.Errorf("unable to get NSX-T Edge Gateway: [%v]", err)
-        }
+        // edge, err := gm.GetNsxtEdgeGatewayById()
+        // if err != nil {
+        //     return "", fmt.Errorf("unable to get NSX-T Edge Gateway: [%v]", err)
+        // }
 
         ipSetDefinition := &types.NsxtFirewallGroup{
             Name:        ipSetName,
             Description: "IP Set for Kubernetes service load balancer",
             Type:        types.FirewallGroupTypeIpSet,
-            OwnerRef:    &types.OpenApiReference{ID: edge.EdgeGateway.ID},
+            OwnerRef:    &types.OpenApiReference{ID: gm.GatewayRef.Id},
             IpAddresses: ipAddresses,
         }
+        client := gm.Client
+        if client == nil || client.VCDClient == nil {
+            return "", fmt.Errorf("VCD client is not initialized")
+        }
 
-        createdIpSet, err := edge.CreateNsxtFirewallGroup(ipSetDefinition)
+        org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+        if err != nil {
+            return "", fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
+        }
+        if org == nil || org.Org == nil {
+            return "", fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
+        }
+        vdc, err := org.GetVDCByName(client.ClusterOVDCName, false)
+        if err != nil {
+            return "", fmt.Errorf("unable to get VDC [%s]: [%v]", client.ClusterOVDCName, err)
+        }
+        createdIpSet, err := vdc.CreateNsxtFirewallGroup(ipSetDefinition)
         if err != nil {
             return "", fmt.Errorf("unable to create IP Set [%s]: [%v]", ipSetName, err)
         }
@@ -171,33 +186,61 @@ func (gm *GatewayManager) DeleteIPSet(ctx context.Context, ipSetName string, fai
         ipSetName, maxRetries, lastErr)
 }
 
+// func (gm *GatewayManager) CreateNsxtFirewallGroup(*NsxtFirewallGroup) (*govcd.NsxtEdgeGateway, error) 
+// func (gm *GatewayManager) CreateNsxtFirewallGroup(firewallGroup *types.NsxtFirewallGroup) (*govcd.NsxtFirewallGroup, error) {
+// {
+//     client := gm.Client
+//     if client == nil || client.VCDClient == nil {
+//         return nil, fmt.Errorf("VCD client is not initialized")
+//     }
 
-func (gm *GatewayManager) GetNsxtEdgeGateway() (*govcd.NsxtEdgeGateway, error) {
-    client := gm.Client
-    if client == nil || client.VCDClient == nil {
-        return nil, fmt.Errorf("VCD client is not initialized")
-    }
+//     org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+//     if err != nil {
+//         return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
+//     }
+//     if org == nil || org.Org == nil {
+//         return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
+//     }
 
-    org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
-    if err != nil {
-        return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
-    }
-    if org == nil || org.Org == nil {
-        return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
-    }
+//     vdc, err := org.GetVDCByName(client.ClusterOVDCName, false)
+//     if err != nil {
+//         return nil, fmt.Errorf("unable to get VDC [%s]: [%v]", client.ClusterOVDCName, err)
+//     }
 
-    vdc, err := org.GetVDCByName(client.ClusterOVDCName, false)
-    if err != nil {
-        return nil, fmt.Errorf("unable to get VDC [%s]: [%v]", client.ClusterOVDCName, err)
-    }
+//     edge, err := vdc.CreateNsxtFirewallGroup(ipSetDefinition)
+//     if err != nil {
+//         return nil, fmt.Errorf("unable to create IP Set [%s]: [%v]", gm.GatewayRef.Name, err)
+//     }
 
-    edge, err := vdc.GetNsxtEdgeGatewayByName(gm.GatewayRef.Name)
-    if err != nil {
-        return nil, fmt.Errorf("unable to get NSX-T Edge Gateway [%s]: [%v]", gm.GatewayRef.Name, err)
-    }
-
-    return edge, nil
-}
+//     return createdIpSet, nil
+// }
 
 
+
+// func (gm *GatewayManager) GetNsxtEdgeGatewayById() (*govcd.NsxtEdgeGateway, error) {
+//     client := gm.Client
+//     if client == nil || client.VCDClient == nil {
+//         return nil, fmt.Errorf("VCD client is not initialized")
+//     }
+
+//     org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+//     if err != nil {
+//         return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
+//     }
+//     if org == nil || org.Org == nil {
+//         return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
+//     }
+
+//     // vdc, err := org.GetVDCByName(client.ClusterOVDCName, false)
+//     // if err != nil {
+//     //     return nil, fmt.Errorf("unable to get VDC [%s]: [%v]", client.ClusterOVDCName, err)
+//     // }
+
+//     edge, err := org.GetNsxtEdgeGatewayById(gm.GatewayRef.Id)
+//     if err != nil {
+//         return nil, fmt.Errorf("unable to get NSX-T Edge Gateway [%s]: [%v]", gm.GatewayRef.Name, err)
+//     }
+
+//     return edge, nil
+// }
 
