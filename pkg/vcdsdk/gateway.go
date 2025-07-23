@@ -24,6 +24,13 @@ import (
 	"strings"
 )
 
+
+const (
+	DefaultLbPoolAlgorithm = "ROUND_ROBIN"
+	DefaultLbPoolGracefulTimeoutPeriod = int32(0) // when service outage occurs, immediately mark as bad
+)
+
+
 type OneArm struct {
 	StartIP string
 	EndIP   string
@@ -36,9 +43,22 @@ type GatewayManager struct {
 	// Client will be refreshed before each call
 	Client     *Client
 	IPAMSubnet string
+	TransparentMode    bool
 }
 
 // CacheGatewayDetails get gateway reference and cache some details in client object
+
+func (gm *GatewayManager) GetLoadBalancerConfig(ctx context.Context, ) error {
+	client := gm.Client
+	lbConfig, resp, err := client.APIClient.EdgeGatewayLoadBalancerApi.GetLoadBalancerConfig(ctx, gm.GatewayRef.Id)
+	if err != nil {
+		return fmt.Errorf("error while creating GatewayManager: [%+v]: [%v]", resp, err)
+	}
+	klog.Infof("Current lb transparentMod : %v", lbConfig.TransparentModeEnabled)
+	return nil
+}
+
+
 func (gm *GatewayManager) cacheGatewayDetails(ctx context.Context, ovdcName string) error {
 	if gm.NetworkName == "" {
 		return fmt.Errorf("network name should not be empty")
@@ -722,9 +742,109 @@ func (gm *GatewayManager) getLoadBalancerPool(ctx context.Context,
 	}, nil
 }
 
+func (gm *GatewayManager) updateLoadBalancerPoolWithIPSet (ctx context.Context, lbPoolName string, poolId string,
+	ipSetRef *swaggerClient.EntityReference, internalPort int32, clusterOrgOrgID string) (*http.Response, error) {
+    client := gm.Client
+	lbPool, resp, err := client.APIClient.EdgeGatewayLoadBalancerPoolApi.GetLoadBalancerPool(ctx, poolId, clusterOrgOrgID)
+    if err != nil {
+		klog.Warningf("Unable to get the details for LB pool [%s]: [%+v]: [%v]",lbPoolName, resp, err)
+        return nil, err
+    }
+    lbPool.MemberGroupRef = ipSetRef
+    lbPool.Members = nil
+    lbPool.Enabled = true
+    lbPool.Algorithm = DefaultLbPoolAlgorithm
+    lbPool.DefaultPort = int32(internalPort)
+    lbPool.GracefulTimeoutPeriod = DefaultLbPoolGracefulTimeoutPeriod
+       
+    resp, err = client.APIClient.EdgeGatewayLoadBalancerPoolApi.UpdateLoadBalancerPool(ctx, lbPool, poolId, clusterOrgOrgID)
+    if err != nil {
+		klog.Warningf("Unable to update LB pool [%s] with IP Set: [%+v]: [%v]",
+        lbPoolName, resp, err)
+        return resp, err
+    }
+    return resp, nil
+}
+
+func (gm *GatewayManager)  createLoadBalancerPoolWithIPSet (ctx context.Context, lbPoolName string,
+	ipSetRef *swaggerClient.EntityReference, internalPort int32, clusterOrgOrgID string) (*http.Response, error) {
+	client := gm.Client
+	// Create new pool with IP Set
+    createPoolParams := &swaggerClient.EdgeLoadBalancerPool{
+            Name:                  lbPoolName,
+            Enabled:               true,
+            Algorithm:             DefaultLbPoolAlgorithm,
+            DefaultPort:           int32(internalPort),
+            GracefulTimeoutPeriod: DefaultLbPoolGracefulTimeoutPeriod,
+            MemberGroupRef:        ipSetRef,
+            GatewayRef:            gm.GatewayRef,
+     }
+
+	 resp, err := client.APIClient.EdgeGatewayLoadBalancerPoolsApi.CreateLoadBalancerPool(
+           ctx, *createPoolParams, clusterOrgOrgID)
+     if err != nil {
+            klog.Warningf("unable to create LB pool [%s] with IP Set: [%+v]: [%v]", lbPoolName, resp, err)
+			return nil, err
+     }
+        
+    // Get pool id after creation
+    createdPool, err := gm.GetLoadBalancerPool(ctx, lbPoolName)
+    if err != nil {
+        klog.Warningf("Pool was created but unable to retrieve it: [%v]", err)
+		return nil, err
+        }
+	klog.Infof("Pool %s was created and able to be retreive", createdPool)
+    return resp, nil
+}
+
+	// createOrUpdateLoadBalancerPoolWithIPSet crée un pool de load balancer qui utilise un IP Set au lieu de membres directs
+func (gm *GatewayManager) createOrUpdateLoadBalancerPoolWithIPSet(ctx context.Context, lbPoolName string, ipSetID string,
+	 internalPort int32) ( *http.Response, error) {
+    client := gm.Client
+    clusterOrg, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+    if err != nil {
+        return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
+    }
+    if clusterOrg == nil || clusterOrg.Org == nil {
+        return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
+    }
+    
+    // Check if pool exists
+    existingPool, err := gm.GetLoadBalancerPool(ctx, lbPoolName)
+    if err != nil && err != govcd.ErrorEntityNotFound {
+        return nil, fmt.Errorf("error checking for existing LB pool [%s]: [%v]", lbPoolName, err)
+    }
+    
+    ipSet, err := gm.GetIPSet(ctx, ipSetID)
+    if err != nil {
+        return nil, fmt.Errorf("unable to get IP Set with ID [%s]: [%v]", ipSetID, err)
+    }
+    
+    ipSetRef := &swaggerClient.EntityReference{
+        Id:   ipSet.ID,
+        Name: ipSet.Name,
+    }
+    
+    if existingPool != nil {
+        // Update existing pool
+		resp, err := gm.updateLoadBalancerPoolWithIPSet(ctx, lbPoolName, existingPool.Id, ipSetRef, internalPort, clusterOrg.Org.ID) 
+		if err != nil {
+			return nil, err
+		}
+		klog.Infof("Pool %s was updated", existingPool)
+        return resp, nil
+    }
+	resp, err:= gm.createLoadBalancerPoolWithIPSet(ctx, lbPoolName, ipSetRef, internalPort, clusterOrg.Org.ID) 
+    if err != nil {
+        return nil, fmt.Errorf("Error when trying to create pool: [%v]", err)
+	}
+	return resp, nil
+}
+
 func (gm *GatewayManager) formLoadBalancerPool(lbPoolName string, ips []string, internalPort int32,
 	healthMonitor *swaggerClient.EdgeLoadBalancerHealthMonitor) (swaggerClient.EdgeLoadBalancerPool,
 	[]swaggerClient.EdgeLoadBalancerPoolMember) {
+	
 	lbPoolMembers := make([]swaggerClient.EdgeLoadBalancerPoolMember, len(ips))
 	for i, ip := range ips {
 		lbPoolMembers[i].IpAddress = ip
@@ -740,8 +860,8 @@ func (gm *GatewayManager) formLoadBalancerPool(lbPoolName string, ips []string, 
 		DefaultPort:           internalPort,
 		Members:               lbPoolMembers,
 		GatewayRef:            gm.GatewayRef,
-		GracefulTimeoutPeriod: int32(0), // when service outage occurs, immediately mark as bad
-		Algorithm:             "ROUND_ROBIN",
+		GracefulTimeoutPeriod: DefaultLbPoolGracefulTimeoutPeriod, 
+		Algorithm:             DefaultLbPoolAlgorithm,
 	}
 	if healthMonitor != nil && healthMonitor.Type_ == "TCP" {
 		lbPool.HealthMonitors = []swaggerClient.EdgeLoadBalancerHealthMonitor{*healthMonitor}
@@ -781,18 +901,32 @@ func (gm *GatewayManager) CreateLoadBalancerPool(ctx context.Context, lbPoolName
 		healthMonitor = &swaggerClient.EdgeLoadBalancerHealthMonitor{Type_: protocol}
 	}
 	lbPoolUniqueIPList := util.NewSet(lbPoolIPList).GetElements()
-	lbPool, lbPoolMembers := gm.formLoadBalancerPool(lbPoolName, lbPoolUniqueIPList, internalPort, healthMonitor)
-	resp, err := client.APIClient.EdgeGatewayLoadBalancerPoolsApi.CreateLoadBalancerPool(ctx, lbPool, org.Org.ID)
-
-	if err != nil {
-		return nil, fmt.Errorf("unable to create loadbalancer pool with name [%s], members [%+v]: resp [%+v]: [%v]",
-			lbPoolName, lbPoolMembers, resp, err)
+	var resp *http.Response = nil
+	// Transparent mode :
+	if gm.TransparentMode {
+		ipSetName:=GetIPSetName(lbPoolName);
+		ipSetID, err := gm.CreateOrUpdateIPSet(ctx, ipSetName, lbPoolUniqueIPList)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IP Set for pool %s port %d: %v",
+				lbPoolName, internalPort, err)
+		}
+		resp, err = gm.createOrUpdateLoadBalancerPoolWithIPSet(ctx, lbPoolName, ipSetID, internalPort) 
+		if err != nil {
+			return nil, fmt.Errorf("unable to create loadbalancer pool with name [%s], ipSetName [%s]: [%v]",
+				lbPoolName, ipSetName, err)
+		}
+	} else {
+		lbPool, lbPoolMembers := gm.formLoadBalancerPool(lbPoolName, lbPoolUniqueIPList, internalPort, healthMonitor)
+		resp, err = client.APIClient.EdgeGatewayLoadBalancerPoolsApi.CreateLoadBalancerPool(ctx, lbPool, org.Org.ID)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create loadbalancer pool with name [%s], members [%+v]: resp [%+v]: [%v]",
+				lbPoolName, lbPoolMembers, resp, err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			return nil, fmt.Errorf("unable to create loadbalancer pool; expected http response [%v], obtained [%v]",
+				http.StatusAccepted, resp.StatusCode)
+		}
 	}
-	if resp.StatusCode != http.StatusAccepted {
-		return nil, fmt.Errorf("unable to create loadbalancer pool; expected http response [%v], obtained [%v]",
-			http.StatusAccepted, resp.StatusCode)
-	}
-
 	taskURL := resp.Header.Get("Location")
 	task := govcd.NewTask(&client.VCDClient.Client)
 	task.Task.HREF = taskURL
@@ -864,16 +998,28 @@ func (gm *GatewayManager) DeleteLoadBalancerPool(ctx context.Context, lbPoolName
 	}
 	klog.Infof("Deleted loadbalancer pool [%s]\n", lbPoolName)
 
+	// In transparent mode we have also to delete ip set
+	if gm.TransparentMode {
+		ipSetName:=GetIPSetName(lbPoolName);
+		klog.Infof("Try to delete IPSet [%s]\n", ipSetName)
+        err = gm.DeleteIPSet(ctx, ipSetName, false)
+        if err != nil {
+        	klog.Warningf("Failed to delete IPSet %s: %v", ipSetName, err)
+            // Continue to clean even if there is any error
+        } else {
+			klog.Infof("Deleted IPSet [%s]\n", ipSetName)
+		}
+	}
 	return nil
 }
 
-func hasSameLBPoolMembers(array1 []swaggerClient.EdgeLoadBalancerPoolMember, array2 []string) bool {
+func hasSameLBPoolMembers(array1 [] string, array2 []string) bool {
 	if array1 == nil || array2 == nil || len(array1) != len(array2) {
 		return false
 	}
 	elementsMap := make(map[string]int)
 	for _, e := range array1 {
-		elementsMap[e.IpAddress] = 1
+		elementsMap[e] = 1
 	}
 	for _, e := range array2 {
 		if _, ok := elementsMap[e]; !ok {
@@ -882,6 +1028,8 @@ func hasSameLBPoolMembers(array1 []swaggerClient.EdgeLoadBalancerPoolMember, arr
 	}
 	return true
 }
+
+
 
 func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName string, lbPoolIPList []string,
 	internalPort int32, protocol string) (*swaggerClient.EntityReference, error) {
@@ -911,7 +1059,12 @@ func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName
 	}
 
 	lbPoolUniqueIPList := util.NewSet(lbPoolIPList).GetElements()
-	if hasSameLBPoolMembers(lbPool.Members, lbPoolUniqueIPList) && lbPool.Members[0].Port == internalPort {
+	// Check if pool need to be update
+	membersIPs, err :=gm.GetLoadBalancerPoolMemberIPs(ctx, lbPoolRef);
+	if err != nil {
+		return nil, fmt.Errorf("unable to get loadbalancer pool members IPs, for pool id [%s] : [%v]", lbPoolRef.Id, err)
+	}
+	if hasSameLBPoolMembers(membersIPs, lbPoolUniqueIPList) && lbPool.DefaultPort == internalPort {
 		klog.Infof("No updates needed for the loadbalancer pool [%s]", lbPool.Name)
 		return lbPoolRef, nil
 	}
@@ -934,29 +1087,39 @@ func (gm *GatewayManager) UpdateLoadBalancerPool(ctx context.Context, lbPoolName
 	if protocol != "" {
 		healthMonitor = &swaggerClient.EdgeLoadBalancerHealthMonitor{Type_: protocol}
 	}
-	updatedLBPool, lbPoolMembers := gm.formLoadBalancerPool(lbPoolName, lbPoolUniqueIPList, internalPort, healthMonitor)
-	resp, err = client.APIClient.EdgeGatewayLoadBalancerPoolApi.UpdateLoadBalancerPool(ctx, updatedLBPool, lbPoolRef.Id, org.Org.ID)
-	if resp != nil && resp.StatusCode != http.StatusAccepted {
-		var responseMessageBytes []byte
-		if gsErr, ok := err.(swaggerClient.GenericSwaggerError); ok {
-			responseMessageBytes = gsErr.Body()
+
+	// Transparent mode :
+	if gm.TransparentMode {
+		ipSetName:=GetIPSetName(lbPoolName);
+		ipSetID, err := gm.CreateOrUpdateIPSet(ctx, ipSetName, lbPoolUniqueIPList)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IP Set for pool %s port %d: %v",
+				lbPoolName, internalPort, err)
 		}
-		return nil, fmt.Errorf(
-			"unable to update loadblanacer pool [%s] having members [%+v]; expected http response [%v], obtained [%v]: resp: [%#v]: [%v]",
-			lbPoolName, lbPoolMembers, http.StatusAccepted, resp.StatusCode, string(responseMessageBytes), err)
-	} else if err != nil {
-		return nil, fmt.Errorf("unable to update loadbalancer pool having name [%s], members [%+v]: resp [%+v]: [%v]",
-			lbPoolName, lbPoolMembers, resp, err)
+		klog.Infof("Updated IpSet %s for lb pool [%s] on gateway [%v]\n", ipSetID, lbPoolName, gm.GatewayRef.Name)
+	} else {
+		updatedLBPool, lbPoolMembers := gm.formLoadBalancerPool(lbPoolName, lbPoolUniqueIPList, internalPort, healthMonitor)
+		resp, err = client.APIClient.EdgeGatewayLoadBalancerPoolApi.UpdateLoadBalancerPool(ctx, updatedLBPool, lbPoolRef.Id, org.Org.ID)
+		if resp != nil && resp.StatusCode != http.StatusAccepted {
+			var responseMessageBytes []byte
+			if gsErr, ok := err.(swaggerClient.GenericSwaggerError); ok {
+				responseMessageBytes = gsErr.Body()
+			}
+			return nil, fmt.Errorf(
+				"unable to update loadblanacer pool [%s] having members [%+v]; expected http response [%v], obtained [%v]: resp: [%#v]: [%v]",
+				lbPoolName, lbPoolMembers, http.StatusAccepted, resp.StatusCode, string(responseMessageBytes), err)
+		} else if err != nil {
+			return nil, fmt.Errorf("unable to update loadbalancer pool having name [%s], members [%+v]: resp [%+v]: [%v]",
+				lbPoolName, lbPoolMembers, resp, err)
+		}
+		taskURL := resp.Header.Get("Location")
+		task := govcd.NewTask(&client.VCDClient.Client)
+		task.Task.HREF = taskURL
+		if err = task.WaitTaskCompletion(); err != nil {
+			return nil, fmt.Errorf("unable to update loadbalancer pool; update task [%s] did not complete: [%v]",
+				taskURL, err)
+		}
 	}
-
-	taskURL := resp.Header.Get("Location")
-	task := govcd.NewTask(&client.VCDClient.Client)
-	task.Task.HREF = taskURL
-	if err = task.WaitTaskCompletion(); err != nil {
-		return nil, fmt.Errorf("unable to update loadbalancer pool; update task [%s] did not complete: [%v]",
-			taskURL, err)
-	}
-
 	// Get the pool to return it
 	lbPoolRef, err = gm.getLoadBalancerPool(ctx, lbPoolName)
 	if err != nil {
@@ -1148,6 +1311,8 @@ func (gm *GatewayManager) UpdateVirtualService(ctx context.Context, virtualServi
 		// update the virtual IP address of the virtual service when one arm is nil
 		vs.VirtualIpAddress = virtualServiceIP
 	}
+	vs.TransparentModeEnabled = gm.TransparentMode
+
 	resp, err := client.APIClient.EdgeGatewayLoadBalancerVirtualServiceApi.UpdateVirtualService(ctx, vs, vsSummary.Id, org.Org.ID)
 	if resp != nil && resp.StatusCode != http.StatusAccepted {
 		var responseMessageBytes []byte
@@ -1235,10 +1400,12 @@ func (gm *GatewayManager) CreateVirtualService(ctx context.Context, virtualServi
 		ApplicationProfile: &swaggerClient.EdgeLoadBalancerApplicationProfile{
 			SystemDefined: true,
 		},
+		TransparentModeEnabled: gm.TransparentMode,
 	}
 	switch vsType {
 	case "TCP":
-		virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
+		// invalid Application Profile System-L4-Application
+		// virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
 		virtualServiceConfig.ApplicationProfile.Type_ = "L4"
 		if useSSL {
 			virtualServiceConfig.ApplicationProfile.Name = "System-SSL-Application"
@@ -1257,7 +1424,8 @@ func (gm *GatewayManager) CreateVirtualService(ctx context.Context, virtualServi
 		break
 	
 	case "UDP":
-		virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
+		// invalid Application Profile System-L4-Application
+		// virtualServiceConfig.ApplicationProfile.Name = "System-L4-Application"
 		virtualServiceConfig.ApplicationProfile.Type_ = "L4"
 		virtualServiceConfig.ServicePorts = []swaggerClient.EdgeLoadBalancerServicePort{
 			{
@@ -1410,12 +1578,14 @@ type PortDetails struct {
 	InternalPort int32
 	UseSSL       bool
 	CertAlias    string
+
 }
 
 // GetLoadBalancer :
 func (gm *GatewayManager) GetLoadBalancer(ctx context.Context, virtualServiceName string, lbPoolName string, oneArm *OneArm) (string, *util.AllocatedResourcesMap, error) {
 
 	allocatedResources := util.AllocatedResourcesMap{}
+	//// Get virtual service en cré un pool dont le nom ne correspond même !!! ou pas....
 	vsSummary, err := gm.GetVirtualService(ctx, virtualServiceName)
 	if err != nil {
 		return "", nil, fmt.Errorf("unable to get summary for LB Virtual Service [%s]: [%v]",
@@ -1521,390 +1691,415 @@ func (gm *GatewayManager) GetLoadBalancerPool(ctx context.Context, lbPoolName st
 }
 
 func (gm *GatewayManager) GetLoadBalancerPoolMemberIPs(ctx context.Context, lbPoolRef *swaggerClient.EntityReference) ([]string, error) {
-	client := gm.Client
-	if lbPoolRef == nil {
-		return nil, govcd.ErrorEntityNotFound
-	}
-	clusterOrg, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
-	}
-	if clusterOrg == nil || clusterOrg.Org == nil {
-		return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
-	}
-	lbPool, resp, err := client.APIClient.EdgeGatewayLoadBalancerPoolApi.GetLoadBalancerPool(ctx, lbPoolRef.Id, clusterOrg.Org.ID)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get the details for LB pool [%s]: [%+v]: [%v]",
-			lbPoolRef.Name, resp, err)
-	}
+    client := gm.Client
+    if lbPoolRef == nil {
+        return nil, govcd.ErrorEntityNotFound
+    }
+    clusterOrg, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+    if err != nil {
+        return nil, fmt.Errorf("unable to get org for org [%s]: [%v]", client.ClusterOrgName, err)
+    }
+    if clusterOrg == nil || clusterOrg.Org == nil {
+        return nil, fmt.Errorf("obtained nil org for name [%s]", client.ClusterOrgName)
+    }
+    lbPool, resp, err := client.APIClient.EdgeGatewayLoadBalancerPoolApi.GetLoadBalancerPool(ctx, lbPoolRef.Id, clusterOrg.Org.ID)
+    if err != nil {
+        return nil, fmt.Errorf("unable to get the details for LB pool [%s]: [%+v]: [%v]",
+            lbPoolRef.Name, resp, err)
+    }
 
-	memberIPs := make([]string, lbPool.MemberCount)
-	members := lbPool.Members
-	for i, member := range members {
-		memberIPs[i] = member.IpAddress
+    // In transparent mode we need to get IPs from IPSet
+    if gm.TransparentMode && lbPool.MemberGroupRef != nil && lbPool.MemberGroupRef.Id != "" {
+        ipSet, err := gm.GetIPSet(ctx, lbPool.MemberGroupRef.Id)
+        if err != nil {
+            return nil, fmt.Errorf("unable to get IP Set [%s] for LB pool [%s]: [%v]",
+                lbPool.MemberGroupRef.Name, lbPoolRef.Name, err)
+        }
+        
+        // get IPs from IP Set
+        return ipSet.IpAddresses, nil
+    } else if gm.TransparentMode && lbPool.MemberGroupRef == nil {
+		// If we are changing from non transparent to transparent mode we return an empty array
+		return make([]string, 0), nil
 	}
-	return memberIPs, nil
+    // else we use IPs of pools members
+    memberIPs := make([]string, lbPool.MemberCount)
+    members := lbPool.Members
+    for i, member := range members {
+        memberIPs[i] = member.IpAddress
+    }
+    return memberIPs, nil
 }
+
+// GetLoadBalancerPoolRef get pool ref from its name
+func (gm *GatewayManager) GetLoadBalancerPoolRef(ctx context.Context, lbPoolName string) (*swaggerClient.EntityReference, error) {
+    return gm.GetLoadBalancerPool(ctx, lbPoolName)
+}
+
+
 
 func (gm *GatewayManager) CreateLoadBalancer(
-	ctx context.Context, virtualServiceNamePrefix string, lbPoolNamePrefix string, lbIpClaimMarker string,
-	ips []string, portDetailsList []PortDetails, oneArm *OneArm, enableVirtualServiceSharedIP bool,
-	portNameToIP map[string]string, providedIP string, resourcesAllocated *util.AllocatedResourcesMap) (string, error) {
-	if len(portDetailsList) == 0 {
-		// nothing to do here
-		klog.Infof("There is no port specified. Hence nothing to do.")
-		return "", fmt.Errorf("nothing to do since http and https ports are not specified")
-	}
+    ctx context.Context, virtualServiceNamePrefix string, lbPoolNamePrefix string, lbIpClaimMarker string,
+    ips []string, portDetailsList []PortDetails, oneArm *OneArm, enableVirtualServiceSharedIP bool,
+    portNameToIP map[string]string, providedIP string, resourcesAllocated *util.AllocatedResourcesMap) (string, error) {
+    if len(portDetailsList) == 0 {
+        // nothing to do here
+        klog.Infof("There is no port specified. Hence nothing to do.")
+        return "", fmt.Errorf("nothing to do since http and https ports are not specified")
+    }
 
-	if gm.GatewayRef == nil {
-		return "", fmt.Errorf("gateway reference should not be nil")
-	}
+    if gm.GatewayRef == nil {
+        return "", fmt.Errorf("gateway reference should not be nil")
+    }
 
-	klog.Infof("Using provided IP [%s]\n", providedIP)
+    klog.Infof("Using provided IP [%s]\n", providedIP)
 
-	client := gm.Client
-	client.RWLock.Lock()
-	defer client.RWLock.Unlock()
+    client := gm.Client
+    client.RWLock.Lock()
+    defer client.RWLock.Unlock()
 
-	// get shared ip when vsSharedIP is true and portNameToIP is not nil
-	sharedVirtualIP := ""
-	portNamesToCreate := make(map[string]bool) // golang does not have set data structure
-	if enableVirtualServiceSharedIP && portNameToIP != nil {
-		for portName, ip := range portNameToIP {
-			if ip != "" {
-				sharedVirtualIP = ip
-			} else {
-				portNamesToCreate[portName] = true
-			}
-		}
-	}
+    // get shared ip when vsSharedIP is true and portNameToIP is not nil
+    sharedVirtualIP := ""
+    portNamesToCreate := make(map[string]bool) // golang does not have set data structure
+    if enableVirtualServiceSharedIP && portNameToIP != nil {
+        for portName, ip := range portNameToIP {
+            if ip != "" {
+                sharedVirtualIP = ip
+            } else {
+                portNamesToCreate[portName] = true
+            }
+        }
+    }
 
-	// Separately loop through all DNAT rules to see if any exist, so that we can reuse the external IP in case a
-	// partial creation of load-balancer is continued and an externalIP was claimed earlier by a dnat rule
-	externalIP := providedIP
-	sharedInternalIP := ""
-	var err error
-	if oneArm != nil {
-		for _, portDetails := range portDetailsList {
-			if portDetails.InternalPort == 0 {
-				continue
-			}
+    // Separately loop through all DNAT rules to see if any exist, so that we can reuse the external IP in case a
+    // partial creation of load-balancer is continued and an externalIP was claimed earlier by a dnat rule
+    externalIP := providedIP
+    sharedInternalIP := ""
+    var err error
+    if oneArm != nil {
+        for _, portDetails := range portDetailsList {
+            if portDetails.InternalPort == 0 {
+                continue
+            }
 
-			virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
-			dnatRuleName := GetDNATRuleName(virtualServiceName)
-			dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
-			if err != nil {
-				return "", fmt.Errorf("unable to retrieve created dnat rule [%s]: [%v]", dnatRuleName, err)
-			}
-			if dnatRuleRef == nil {
-				continue // ths implies that the rule does not exist
-			}
+            virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
+            dnatRuleName := GetDNATRuleName(virtualServiceName)
+            dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
+            if err != nil {
+                return "", fmt.Errorf("unable to retrieve created dnat rule [%s]: [%v]", dnatRuleName, err)
+            }
+            if dnatRuleRef == nil {
+                continue // ths implies that the rule does not exist
+            }
 
-			if externalIP != "" && externalIP != dnatRuleRef.ExternalIP {
-				return "", fmt.Errorf("as per dnat there are two external IP rules for the same service: [%s], [%s]",
-					externalIP, dnatRuleRef.ExternalIP)
-			}
+            if externalIP != "" && externalIP != dnatRuleRef.ExternalIP {
+                return "", fmt.Errorf("as per dnat there are two external IP rules for the same service: [%s], [%s]",
+                    externalIP, dnatRuleRef.ExternalIP)
+            }
 
-			externalIP = dnatRuleRef.ExternalIP
-			if enableVirtualServiceSharedIP {
-				sharedInternalIP = dnatRuleRef.InternalIP
-			}
-		}
-	}
+            externalIP = dnatRuleRef.ExternalIP
+            if enableVirtualServiceSharedIP {
+                sharedInternalIP = dnatRuleRef.InternalIP
+            }
+        }
+    }
 
-	// 3 variables: enableVirtualServiceSharedIP, oneArm, sharedIP
-	// if enableVirtualServiceSharedIP is true and oneArm is nil, no internal ip is used
-	// if enableVirtualServiceSharedIP is true and oneArm is not nil, an internal ip will be used and shared
-	// if enableVirtualServiceSharedIP is false and oneArm is nil: this is an error case which is handled earlier in ValidateCloudConfig.
-	// if enableVirtualServiceSharedIP is false and oneArm is not nil, a pair of internal IPs will be used and not shared
-	if enableVirtualServiceSharedIP && oneArm == nil { // no internal ip used so no dnat rule needed
-		if sharedVirtualIP != "" { // shared virtual ip is an external ip
-			externalIP = sharedVirtualIP
-		}
-	} else if enableVirtualServiceSharedIP && oneArm != nil { // internal ip used, dnat rule is needed
-		if sharedInternalIP == "" { // no dnat rule has been created yet
-			sharedInternalIP, err = gm.GetUnusedInternalIPAddress(ctx, oneArm)
-			if err != nil {
-				return "", fmt.Errorf("unable to get internal IP address for one-arm mode: [%v]", err)
-			}
-		}
-	}
+    // 3 variables: enableVirtualServiceSharedIP, oneArm, sharedIP
+    // if enableVirtualServiceSharedIP is true and oneArm is nil, no internal ip is used
+    // if enableVirtualServiceSharedIP is true and oneArm is not nil, an internal ip will be used and shared
+    // if enableVirtualServiceSharedIP is false and oneArm is nil: this is an error case which is handled earlier in ValidateCloudConfig.
+    // if enableVirtualServiceSharedIP is false and oneArm is not nil, a pair of internal IPs will be used and not shared
+    if enableVirtualServiceSharedIP && oneArm == nil { // no internal ip used so no dnat rule needed
+        if sharedVirtualIP != "" { // shared virtual ip is an external ip
+            externalIP = sharedVirtualIP
+        }
+    } else if enableVirtualServiceSharedIP && oneArm != nil { // internal ip used, dnat rule is needed
+        if sharedInternalIP == "" { // no dnat rule has been created yet
+            sharedInternalIP, err = gm.GetUnusedInternalIPAddress(ctx, oneArm)
+            if err != nil {
+                return "", fmt.Errorf("unable to get internal IP address for one-arm mode: [%v]", err)
+            }
+        }
+    }
 
-	if externalIP == "" {
-		isGatewayUsingIpSpaces, err := gm.IsUsingIpSpaces()
-		if err != nil {
-			return "", fmt.Errorf("unable to create load balancer. err [%v]", err)
-		}
-		if isGatewayUsingIpSpaces {
-			klog.Infof("Determined gateway [%s] is using IP spaces, using IP space specific logic to reserve an IP", gm.GatewayRef.Name)
-			externalIP, err = gm.ReserveIpForLoadBalancer(ctx, lbIpClaimMarker)
-			if err != nil {
-				return "", fmt.Errorf("unable to reservce IP address for load balancer. error [%v]", err)
-			}
-		} else {
-			klog.Infof("Determined gateway [%s] is not using IP spaces, using legacy IPAM solution to find a free IP", gm.GatewayRef.Name)
-			externalIP, err = gm.GetUnusedExternalIPAddress(ctx, gm.IPAMSubnet)
-			if err != nil {
-				return "", fmt.Errorf("unable to get unused IP address from subnet [%s]: [%v]",
-					gm.IPAMSubnet, err)
-			}
-		}
-	}
-	klog.Infof("Using VIP [%s] for virtual service\n", externalIP)
+    if externalIP == "" {
+        isGatewayUsingIpSpaces, err := gm.IsUsingIpSpaces()
+        if err != nil {
+            return "", fmt.Errorf("unable to create load balancer. err [%v]", err)
+        }
+        if isGatewayUsingIpSpaces {
+            klog.Infof("Determined gateway [%s] is using IP spaces, using IP space specific logic to reserve an IP", gm.GatewayRef.Name)
+            externalIP, err = gm.ReserveIpForLoadBalancer(ctx, lbIpClaimMarker)
+            if err != nil {
+                return "", fmt.Errorf("unable to reservce IP address for load balancer. error [%v]", err)
+            }
+        } else {
+            klog.Infof("Determined gateway [%s] is not using IP spaces, using legacy IPAM solution to find a free IP", gm.GatewayRef.Name)
+            externalIP, err = gm.GetUnusedExternalIPAddress(ctx, gm.IPAMSubnet)
+            if err != nil {
+                return "", fmt.Errorf("unable to get unused IP address from subnet [%s]: [%v]",
+                    gm.IPAMSubnet, err)
+            }
+        }
+    }
+    klog.Infof("Using VIP [%s] for virtual service\n", externalIP)
 
-	for _, portDetails := range portDetailsList {
-		if portDetails.InternalPort == 0 {
-			klog.Infof("No internal port specified for [%s], hence loadbalancer not created\n",
-				portDetails.PortSuffix)
-			continue
-		}
+    for _, portDetails := range portDetailsList {
+        if portDetails.InternalPort == 0 {
+            klog.Infof("No internal port specified for [%s], hence loadbalancer not created\n",
+                portDetails.PortSuffix)
+            continue
+        }
 
-		virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
-		lbPoolName := fmt.Sprintf("%s-%s", lbPoolNamePrefix, portDetails.PortSuffix)
+        virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
+        lbPoolName := fmt.Sprintf("%s-%s", lbPoolNamePrefix, portDetails.PortSuffix)
 
-		vsSummary, err := gm.GetVirtualService(ctx, virtualServiceName)
-		if err != nil {
-			return "", fmt.Errorf("unexpected error while querying for virtual service [%s]: [%v]",
-				virtualServiceName, err)
-		}
-		if vsSummary != nil {
-			if vsSummary.LoadBalancerPoolRef.Name != lbPoolName {
-				return "", fmt.Errorf("virtual Service [%s] found with unexpected loadbalancer pool [%s]",
-					virtualServiceName, lbPoolName)
-			}
+        vsSummary, err := gm.GetVirtualService(ctx, virtualServiceName)
+        if err != nil {
+            return "", fmt.Errorf("unexpected error while querying for virtual service [%s]: [%v]",
+                virtualServiceName, err)
+        }
+        if vsSummary != nil {
+            if vsSummary.LoadBalancerPoolRef.Name != lbPoolName {
+                return "", fmt.Errorf("virtual Service [%s] found with unexpected loadbalancer pool [%s]",
+                    virtualServiceName, lbPoolName)
+            }
 
-			klog.V(3).Infof("LoadBalancer Virtual Service [%s] already exists", virtualServiceName)
-			resourcesAllocated.Insert(VcdResourceVirtualService, &swaggerClient.EntityReference{
-				Name: vsSummary.Name,
-				Id:   vsSummary.Id,
-			})
+            klog.V(3).Infof("LoadBalancer Virtual Service [%s] already exists", virtualServiceName)
+            resourcesAllocated.Insert(VcdResourceVirtualService, &swaggerClient.EntityReference{
+                Name: vsSummary.Name,
+                Id:   vsSummary.Id,
+            })
 
-			if err = gm.CheckIfVirtualServiceIsPending(ctx, virtualServiceName); err != nil {
-				return "", err
-			}
+            if err = gm.CheckIfVirtualServiceIsPending(ctx, virtualServiceName); err != nil {
+                return "", err
+            }
 
-			continue
-		}
+            continue
+        }
 
-		virtualServiceIP := externalIP
-		if oneArm != nil {
-			internalIP := ""
-			if enableVirtualServiceSharedIP {
-				// a new feature in VCD >= 10.4 allows virtual services to be
-				// created with the same IP and different ports
-				internalIP = sharedInternalIP
-			} else {
-				internalIP, err = gm.GetUnusedInternalIPAddress(ctx, oneArm)
-				if err != nil {
-					return "", fmt.Errorf("unable to get internal IP address for one-arm mode: [%v]", err)
-				}
-			}
+        virtualServiceIP := externalIP
+        if oneArm != nil {
+            internalIP := ""
+            if enableVirtualServiceSharedIP {
+                // a new feature in VCD >= 10.4 allows virtual services to be
+                // created with the same IP and different ports
+                internalIP = sharedInternalIP
+            } else {
+                internalIP, err = gm.GetUnusedInternalIPAddress(ctx, oneArm)
+                if err != nil {
+                    return "", fmt.Errorf("unable to get internal IP address for one-arm mode: [%v]", err)
+                }
+            }
 
-			dnatRuleName := GetDNATRuleName(virtualServiceName)
+            dnatRuleName := GetDNATRuleName(virtualServiceName)
 
-			// create app port profile
-			appPortProfileName := GetAppPortProfileName(dnatRuleName)
-			appPortProfile, err := gm.CreateAppPortProfile(appPortProfileName, portDetails.ExternalPort)
-			if err != nil {
-				return "", fmt.Errorf("failed to create App Port Profile: [%v]", err)
-			}
-			if appPortProfile == nil || appPortProfile.NsxtAppPortProfile == nil {
-				return "", fmt.Errorf("creation of app port profile succeeded but app port profile is empty")
-			}
-			resourcesAllocated.Insert(VcdResourceAppPortProfile, &swaggerClient.EntityReference{
-				Name: appPortProfile.NsxtAppPortProfile.Name,
-				Id:   appPortProfile.NsxtAppPortProfile.ID,
-			})
+            // create app port profile
+            appPortProfileName := GetAppPortProfileName(dnatRuleName)
+            appPortProfile, err := gm.CreateAppPortProfile(appPortProfileName, portDetails.ExternalPort)
+            if err != nil {
+                return "", fmt.Errorf("failed to create App Port Profile: [%v]", err)
+            }
+            if appPortProfile == nil || appPortProfile.NsxtAppPortProfile == nil {
+                return "", fmt.Errorf("creation of app port profile succeeded but app port profile is empty")
+            }
+            resourcesAllocated.Insert(VcdResourceAppPortProfile, &swaggerClient.EntityReference{
+                Name: appPortProfile.NsxtAppPortProfile.Name,
+                Id:   appPortProfile.NsxtAppPortProfile.ID,
+            })
 
-			if err = gm.CreateDNATRule(ctx, dnatRuleName, externalIP, internalIP,
-				portDetails.ExternalPort, portDetails.InternalPort, appPortProfile); err != nil {
-				return "", fmt.Errorf("unable to create dnat rule [%s:%d]=>[%s:%d] with profile [%v]: [%v]",
-					externalIP, portDetails.ExternalPort, internalIP, portDetails.InternalPort, appPortProfile, err)
-			}
-			resourcesAllocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
-				Name: dnatRuleName,
-			})
+            if err = gm.CreateDNATRule(ctx, dnatRuleName, externalIP, internalIP,
+                portDetails.ExternalPort, portDetails.InternalPort, appPortProfile); err != nil {
+                return "", fmt.Errorf("unable to create dnat rule [%s:%d]=>[%s:%d] with profile [%v]: [%v]",
+                    externalIP, portDetails.ExternalPort, internalIP, portDetails.InternalPort, appPortProfile, err)
+            }
+            resourcesAllocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
+                Name: dnatRuleName,
+            })
 
-			// use the internal IP to create virtual service
-			virtualServiceIP = internalIP
+            // use the internal IP to create virtual service
+            virtualServiceIP = internalIP
 
-			// We get an IP address above and try to get-or-create a DNAT rule from external IP => internal IP.
-			// If the rule already existed, the old DNAT rule will remain unchanged. Hence, we get the old externalIP
-			// from the old rule and use it. What happens to the new externalIP that we selected above? It just remains
-			// unused and hence does not get allocated and disappears. Since there is no IPAM based resource
-			// _acquisition_, the new externalIP can just be forgotten about.
-			dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
-			if err != nil {
-				return "", fmt.Errorf("unable to retrieve created dnat rule [%s]: [%v]", dnatRuleName, err)
-			}
-			if dnatRuleRef == nil {
-				return "", fmt.Errorf("retrieved dnat rule ref is nil")
-			}
-			resourcesAllocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
-				Name: dnatRuleRef.Name,
-				Id:   dnatRuleRef.ID,
-			})
+            // We get an IP address above and try to get-or-create a DNAT rule from external IP => internal IP.
+            // If the rule already existed, the old DNAT rule will remain unchanged. Hence, we get the old externalIP
+            // from the old rule and use it. What happens to the new externalIP that we selected above? It just remains
+            // unused and hence does not get allocated and disappears. Since there is no IPAM based resource
+            // _acquisition_, the new externalIP can just be forgotten about.
+            dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
+            if err != nil {
+                return "", fmt.Errorf("unable to retrieve created dnat rule [%s]: [%v]", dnatRuleName, err)
+            }
+            if dnatRuleRef == nil {
+                return "", fmt.Errorf("retrieved dnat rule ref is nil")
+            }
+            resourcesAllocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
+                Name: dnatRuleRef.Name,
+                Id:   dnatRuleRef.ID,
+            })
 
-			externalIP = dnatRuleRef.ExternalIP
-		} else if oneArm == nil && enableVirtualServiceSharedIP { // use external ip for virtual service
-			// no dnat rule is needed because there is a feature in VCD >= 10.4
-			// in which multiple virtual services can be created with the same IP and different ports
-			virtualServiceIP = externalIP
-		}
+            externalIP = dnatRuleRef.ExternalIP
+        } else if oneArm == nil && enableVirtualServiceSharedIP { // use external ip for virtual service
+            // no dnat rule is needed because there is a feature in VCD >= 10.4
+            // in which multiple virtual services can be created with the same IP and different ports
+            virtualServiceIP = externalIP
+        }
 
-		segRef, err := gm.GetLoadBalancerSEG(ctx)
-		if err != nil {
-			return "", fmt.Errorf("unable to get service engine group from edge [%s]: [%v]",
-				gm.GatewayRef.Name, err)
-		}
+        segRef, err := gm.GetLoadBalancerSEG(ctx)
+        if err != nil {
+            return "", fmt.Errorf("unable to get service engine group from edge [%s]: [%v]",
+                gm.GatewayRef.Name, err)
+        }
 
-		lbPoolRef, err := gm.CreateLoadBalancerPool(ctx, lbPoolName, ips, portDetails.InternalPort,
-			portDetails.Protocol)
-		if err != nil {
-			return "", fmt.Errorf("unable to create load balancer pool [%s]: [%v]", lbPoolName, err)
-		}
-		resourcesAllocated.Insert(VcdResourceLoadBalancerPool, lbPoolRef)
+        // Initialiser lbPoolRef à nil avant le bloc conditionnel
+        var lbPoolRef *swaggerClient.EntityReference
+        lbPoolRef, err = gm.CreateLoadBalancerPool(ctx, lbPoolName, ips, portDetails.InternalPort, portDetails.Protocol)
+        if err != nil {
+             return "", fmt.Errorf("unable to create load balancer pool [%s]: [%v]", lbPoolName, err)
+        }
+        // Ajouter la ressource au suivi des ressources allouées
+        resourcesAllocated.Insert(VcdResourceLoadBalancerPool, lbPoolRef)
 
-		virtualServiceRef, err := gm.CreateVirtualService(ctx, virtualServiceName, lbPoolRef, segRef,
-			virtualServiceIP, portDetails.Protocol, portDetails.ExternalPort,
-			portDetails.UseSSL, portDetails.CertAlias)
-		if err != nil {
-			// return  plain error if vcdsdk.VirtualServicePendingError is returned. Helps the caller recognize that the
-			// error is because VirtualService is still in Pending state.
-			if _, ok := err.(*VirtualServicePendingError); ok {
-				resourcesAllocated.Insert(VcdResourceVirtualService, virtualServiceRef)
-				klog.Infof("Load Balancer with virtual service [%v], pool [%v] on gateway [%s] is pending\n",
-					virtualServiceRef, lbPoolRef, gm.GatewayRef.Name)
-				continue
-			}
-			return "", err
-		}
-		resourcesAllocated.Insert(VcdResourceVirtualService, virtualServiceRef)
+        virtualServiceRef, err := gm.CreateVirtualService(ctx, virtualServiceName, lbPoolRef, segRef,
+            virtualServiceIP, portDetails.Protocol, portDetails.ExternalPort,
+            portDetails.UseSSL, portDetails.CertAlias)
+        if err != nil {
+            // return  plain error if vcdsdk.VirtualServicePendingError is returned. Helps the caller recognize that the
+            // error is because VirtualService is still in Pending state.
+            if _, ok := err.(*VirtualServicePendingError); ok {
+                resourcesAllocated.Insert(VcdResourceVirtualService, virtualServiceRef)
+                klog.Infof("Load Balancer with virtual service [%v], pool [%v] on gateway [%s] is pending\n",
+                    virtualServiceRef, lbPoolRef, gm.GatewayRef.Name)
+                continue
+            }
+            return "", err
+        }
+        resourcesAllocated.Insert(VcdResourceVirtualService, virtualServiceRef)
 
-		klog.Infof("Created Load Balancer with virtual service [%v], pool [%v] on gateway [%s]\n",
-			virtualServiceRef, lbPoolRef, gm.GatewayRef.Name)
-	}
+        klog.Infof("Created Load Balancer with virtual service [%v], pool [%v] on gateway [%s]\n",
+            virtualServiceRef, lbPoolRef, gm.GatewayRef.Name)
+    }
 
-	resourcesAllocated.Insert("externalIP", &swaggerClient.EntityReference{
-		Name: externalIP,
-	})
+    resourcesAllocated.Insert("externalIP", &swaggerClient.EntityReference{
+        Name: externalIP,
+    })
 
-	return externalIP, nil
+    return externalIP, nil
 }
+
 
 func (gm *GatewayManager) DeleteLoadBalancer(
-	ctx context.Context, virtualServiceNamePrefix string, lbPoolNamePrefix string, lbIpClaimMarker string,
-	portDetailsList []PortDetails, oneArm *OneArm, resourcesDeallocated *util.AllocatedResourcesMap) (string, error) {
+    ctx context.Context, virtualServiceNamePrefix string, lbPoolNamePrefix string, lbIpClaimMarker string,
+    portDetailsList []PortDetails, oneArm *OneArm, resourcesDeallocated *util.AllocatedResourcesMap) (string, error) {
 
-	if gm == nil {
-		return "", fmt.Errorf("GatewayManager cannot be nil")
-	}
+    if gm == nil {
+        return "", fmt.Errorf("GatewayManager cannot be nil")
+    }
 
-	client := gm.Client
-	client.RWLock.Lock()
-	defer client.RWLock.Unlock()
+    client := gm.Client
+    client.RWLock.Lock()
+    defer client.RWLock.Unlock()
 
-	// TODO: try to continue in case of errors
-	var err error
+    // TODO: try to continue in case of errors
+    var err error
 
-	// Here the principle is to delete what is available; retry in case of failure
-	// but do not fail for missing entities, since a retry will always have missing
-	// entities.
-	rdeVIP := ""
-	for _, portDetails := range portDetailsList {
-		if portDetails.InternalPort == 0 {
-			klog.Infof("No internal port specified for [%s], hence loadbalancer not created\n",
-				portDetails.PortSuffix)
-			continue
-		}
+    // Here the principle is to delete what is available; retry in case of failure
+    // but do not fail for missing entities, since a retry will always have missing
+    // entities.
+    rdeVIP := ""
+    for _, portDetails := range portDetailsList {
+        if portDetails.InternalPort == 0 {
+            klog.Infof("No internal port specified for [%s], hence loadbalancer not created\n",
+                portDetails.PortSuffix)
+            continue
+        }
 
-		virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
-		lbPoolName := fmt.Sprintf("%s-%s", lbPoolNamePrefix, portDetails.PortSuffix)
+        virtualServiceName := fmt.Sprintf("%s-%s", virtualServiceNamePrefix, portDetails.PortSuffix)
+        lbPoolName := fmt.Sprintf("%s-%s", lbPoolNamePrefix, portDetails.PortSuffix)
 
-		// get external IP
-		// it is weird that we are computing the same external Id multiple times in the loop
-		dnatRuleName := ""
-		if oneArm != nil {
-			dnatRuleName = GetDNATRuleName(virtualServiceName)
-			dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
-			if err != nil {
-				return "", fmt.Errorf("unable to get dnat rule ref for nat rule [%s]: [%v]", dnatRuleName, err)
-			}
-			if dnatRuleRef != nil {
-				rdeVIP = dnatRuleRef.ExternalIP
-			}
-		} else {
-			vsSummary, err := gm.GetVirtualService(ctx, virtualServiceName)
-			if err != nil {
-				return "", fmt.Errorf("unable to get summary for LB Virtual Service [%s]: [%v]",
-					virtualServiceName, err)
-			}
-			if vsSummary != nil {
-				rdeVIP = vsSummary.VirtualIpAddress
-			}
-		}
+        // get external IP
+        // it is weird that we are computing the same external Id multiple times in the loop
+        dnatRuleName := ""
+        if oneArm != nil {
+            dnatRuleName = GetDNATRuleName(virtualServiceName)
+            dnatRuleRef, err := gm.GetNATRuleRef(ctx, dnatRuleName)
+            if err != nil {
+                return "", fmt.Errorf("unable to get dnat rule ref for nat rule [%s]: [%v]", dnatRuleName, err)
+            }
+            if dnatRuleRef != nil {
+                rdeVIP = dnatRuleRef.ExternalIP
+            }
+        } else {
+            vsSummary, err := gm.GetVirtualService(ctx, virtualServiceName)
+            if err != nil {
+                return "", fmt.Errorf("unable to get summary for LB Virtual Service [%s]: [%v]",
+                    virtualServiceName, err)
+            }
+            if vsSummary != nil {
+                rdeVIP = vsSummary.VirtualIpAddress
+            }
+        }
 
-		err = gm.DeleteVirtualService(ctx, virtualServiceName, false)
-		if err != nil {
-			if vsBusyErr, ok := err.(*VirtualServiceBusyError); ok {
-				klog.Errorf("delete virtual service failed; virtual service [%s] is busy: [%v]",
-					virtualServiceName, err)
-				return "", vsBusyErr
-			}
-			return "", fmt.Errorf("unable to delete virtual service [%s]: [%v]", virtualServiceName, err)
-		}
-		// removal from vCDResourceSet is based on ID and type comparison.
-		virtualServiceRef := &swaggerClient.EntityReference{
-			Name: virtualServiceName,
-		}
-		resourcesDeallocated.Insert(VcdResourceVirtualService, virtualServiceRef)
+        err = gm.DeleteVirtualService(ctx, virtualServiceName, false)
+        if err != nil {
+            if vsBusyErr, ok := err.(*VirtualServiceBusyError); ok {
+                klog.Errorf("delete virtual service failed; virtual service [%s] is busy: [%v]",
+                    virtualServiceName, err)
+                return "", vsBusyErr
+            }
+            return "", fmt.Errorf("unable to delete virtual service [%s]: [%v]", virtualServiceName, err)
+        }
+        // removal from vCDResourceSet is based on ID and type comparison.
+        virtualServiceRef := &swaggerClient.EntityReference{
+            Name: virtualServiceName,
+        }
+        resourcesDeallocated.Insert(VcdResourceVirtualService, virtualServiceRef)
+        err = gm.DeleteLoadBalancerPool(ctx, lbPoolName, false)
+        if err != nil {
+            if lbPoolBusyErr, ok := err.(*LoadBalancerPoolBusyError); ok {
+                klog.Errorf("delete loadbalancer pool failed; loadbalancer pool [%s] is busy: [%v]", lbPoolName, err)
+                return "", lbPoolBusyErr
+            }
+            return "", fmt.Errorf("unable to delete load balancer pool [%s]: [%v]", lbPoolName, err)
+        }
+        resourcesDeallocated.Insert(VcdResourceLoadBalancerPool, &swaggerClient.EntityReference{
+            Name: lbPoolName,
+        })
 
-		err = gm.DeleteLoadBalancerPool(ctx, lbPoolName, false)
-		if err != nil {
-			if lbPoolBusyErr, ok := err.(*LoadBalancerPoolBusyError); ok {
-				klog.Errorf("delete loadbalancer pool failed; loadbalancer pool [%s] is busy: [%v]", lbPoolName, err)
-				return "", lbPoolBusyErr
-			}
-			return "", fmt.Errorf("unable to delete load balancer pool [%s]: [%v]", lbPoolName, err)
-		}
-		resourcesDeallocated.Insert(VcdResourceLoadBalancerPool, &swaggerClient.EntityReference{
-			Name: lbPoolName,
-		})
+        if oneArm != nil {
+            err = gm.DeleteDNATRule(ctx, dnatRuleName, false)
+            if err != nil {
+                return "", fmt.Errorf("unable to delete dnat rule [%s]: [%v]", dnatRuleName, err)
+            }
+            resourcesDeallocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
+                Name: dnatRuleName,
+            })
+            appPortProfileName := GetAppPortProfileName(dnatRuleName)
+            err = gm.DeleteAppPortProfile(appPortProfileName, false)
+            if err != nil {
+                return "", fmt.Errorf("unable to delete app port profile [%s]: [%v]", appPortProfileName, err)
+            }
+            resourcesDeallocated.Insert(VcdResourceAppPortProfile, &swaggerClient.EntityReference{
+                Name: appPortProfileName,
+            })
+        }
+    }
 
-		if oneArm != nil {
-			err = gm.DeleteDNATRule(ctx, dnatRuleName, false)
-			if err != nil {
-				return "", fmt.Errorf("unable to delete dnat rule [%s]: [%v]", dnatRuleName, err)
-			}
-			resourcesDeallocated.Insert(VcdResourceDNATRule, &swaggerClient.EntityReference{
-				Name: dnatRuleName,
-			})
-			appPortProfileName := GetAppPortProfileName(dnatRuleName)
-			err = gm.DeleteAppPortProfile(appPortProfileName, false)
-			if err != nil {
-				return "", fmt.Errorf("unable to delete app port profile [%s]: [%v]", appPortProfileName, err)
-			}
-			resourcesDeallocated.Insert(VcdResourceAppPortProfile, &swaggerClient.EntityReference{
-				Name: appPortProfileName,
-			})
-		}
-	}
+    isGatewayUsingIpSpaces, err := gm.IsUsingIpSpaces()
+    if err != nil {
+        return "", fmt.Errorf("unable to release IP [%s] used by load balancer. err [%v]", rdeVIP, err)
+    }
+    if isGatewayUsingIpSpaces {
+        klog.Infof("Determined gateway [%s] is using IP spaces, using IP space specific logic to release IP [%s]", gm.GatewayRef.Name, rdeVIP)
+        err = gm.ReleaseIpFromLoadBalancer(ctx, rdeVIP, lbIpClaimMarker)
+        if err != nil {
+            return "", fmt.Errorf("unable to release IP address [%s] from load balancer. error [%v]", rdeVIP, err)
+        }
+    }
+    // if gateway is using IP blocks, no need to explicitly release the IP
 
-	isGatewayUsingIpSpaces, err := gm.IsUsingIpSpaces()
-	if err != nil {
-		return "", fmt.Errorf("unable to release IP [%s] used by load balancer. err [%v]", rdeVIP, err)
-	}
-	if isGatewayUsingIpSpaces {
-		klog.Infof("Determined gateway [%s] is using IP spaces, using IP space specific logic to release IP [%s]", gm.GatewayRef.Name, rdeVIP)
-		err = gm.ReleaseIpFromLoadBalancer(ctx, rdeVIP, lbIpClaimMarker)
-		if err != nil {
-			return "", fmt.Errorf("unable to release IP address [%s] from load balancer. error [%v]", rdeVIP, err)
-		}
-	}
-	// if gateway is using IP blocks, no need to explicitly release the IP
-
-	return rdeVIP, nil
+    return rdeVIP, nil
 }
+
 
 func (gm *GatewayManager) UpdateLoadBalancer(ctx context.Context, lbPoolName string, virtualServiceName string,
 	ips []string, externalIP string, internalPort int32, externalPort int32, oneArm *OneArm, enableVirtualServiceSharedIP bool, protocol string,
